@@ -2,13 +2,14 @@ use crate::riak::client::RiakError;
 use base64::{engine::general_purpose, Engine as _};
 use reqwest::header::HeaderMap;
 
+#[derive(Debug)]
 pub struct Object {
     pub value: Vec<u8>,
     pub vclock: VClock,
 }
 
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct VClock(pub Vec<u8>);
 
 impl VClock {
