@@ -70,6 +70,8 @@ impl Client {
         let new_vclock = VClock::from_headers(&headers)?;
         Ok(new_vclock)
     }
+
+    // TODO:delete
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -176,9 +178,12 @@ mod tests {
         let client = Client::new(HOST);
         let key = format!("key-{}", random::<u32>());
         let value = b"hello-riak".to_vec();
+        dbg!(&key);
 
-        let vc = client.put(BUCKET, &key, value.clone(), None).await.unwrap();
+        let _vc = client.put(BUCKET, &key, value.clone(), None).await.unwrap();
         let obj = client.get(BUCKET, &key).await.unwrap();
+        let _ = dbg!(String::from_utf8(obj.value.clone()));
+        dbg!(&obj.vclock.to_base64());
 
         assert_eq!(obj.value, value);
         // Riak does NOT guarantee returning vclock on PUT.
@@ -191,16 +196,24 @@ mod tests {
     async fn it_updates_value_and_increments_vclock() {
         let client = Client::new(HOST);
         let key = format!("key-{}", random::<u32>());
+        dbg!(&key);
 
-        let vc1 = client.put(BUCKET, &key, b"first".to_vec(), None).await.unwrap();
+        let _vc1 = client.put(BUCKET, &key, b"first".to_vec(), None).await.unwrap();
         // Riak requires latest vclock from GET before update
         let current = client.get(BUCKET, &key).await.unwrap();
+        let _ = dbg!(String::from_utf8(current.value));
+        dbg!(&current.vclock.to_base64());
+
         let vc2 = client
             .put(BUCKET, &key, b"second".to_vec(), Some(current.vclock.clone()))
             .await
             .unwrap();
 
         let obj = client.get(BUCKET, &key).await.unwrap();
+
+        let _ = dbg!(String::from_utf8(obj.value.clone()));
+        dbg!(&obj.vclock.to_base64());
+
         assert_eq!(obj.value, b"second".to_vec());
         // assert_ne!(vc1.0, vc2.0);
         // vc1 from initial PUT may be empty; compare authoritative vclocks via GET
