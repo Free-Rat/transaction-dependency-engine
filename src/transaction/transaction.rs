@@ -19,6 +19,8 @@ struct Transaction<'a> {
     write_set: HashMap<String, Vec<u8>>,
     state: TransactionStatus,
     connection: &'a Client,
+    // TODO: timestamp proposed ?
+    // TODO: timestamp Approved ?
 }
 
 impl<'a> Transaction<'a> {
