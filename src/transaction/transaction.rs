@@ -12,6 +12,7 @@ enum TransactionStatus {
     Rejected
 }
 
+
 #[derive(Debug)]
 struct Transaction<'a> {
     id: Uuid,
@@ -56,16 +57,25 @@ impl<'a> Transaction<'a> {
     }
 
     fn write(&mut self, key: &str, value: Vec<u8> ) {
-        // riak client put is later in commit
-        // TODO: save to write_set
-        // TODO: save to read_set - for ony write transactions
+        // save to write_set
         let record = self.write_set.entry(key.into()).or_default();
         *record = value;
 
+        // save to read_set - for ony write transactions
+        // to jednak nie jest potrzebne, jeśli nie ma readów do zmiennej
+        // to znaczy ze na niej po prostu nie polega mi możemy to zwalidować just fine
+        //
+        // let record = self.read_set.entry(key.into()).or_default();
+        // *record = value;
+
+        // riak client put is later in commit
     }
 
     fn find_predecessor(&self, key: &str) -> Option<Uuid> {
+        self.connection.get("status", key)
         Some(Uuid::nil()) // TODO: real search 
+        // walidacja swojego reada, potencjalnie wiecej niz jeden rodzic
+        // confict reasolution
     }
 
     fn read(&mut self, key: &str) -> Option<Vec<u8>> {
@@ -82,11 +92,10 @@ impl<'a> Transaction<'a> {
     fn commit(&mut self) {
         // TODO: raik put for write_set
         self.change_status(TransactionStatus::Commited);
+
+
     }
     
-    fn validate(&self) {
-        
-    }
 
     fn change_status(&mut self, new_status: TransactionStatus) {
         // TODO: raik update
@@ -96,6 +105,26 @@ impl<'a> Transaction<'a> {
         // };
         self.state = new_status;
     }
+}
+
+
+// przyjmuje id zbioru proponowanych tx dla danej zmiennej
+// zwraca ta która "wygrała"
+// jej status zmini na 'approved'
+// a reszcie na 'rejected'
+fn choose_tx(ids: Vec<Uuid>) -> Uuid {
+    let target = "srds0000-0000-0000-0000-000000000000";
+
+    ids.into_iter()
+        .min_by_key(|id| {
+            let s = id.to_string();
+
+            s.chars()
+                .zip(target.chars())
+                .map(|(a, b)| (a as i32 - b as i32).abs())
+                .sum::<i32>()
+        })
+        .expect("ids must not be empty")
 }
 
 
@@ -109,10 +138,10 @@ mod tests {
         let mut tx = Transaction::new(client);
         // let ob_url = r.object_url("test_bucket", "test_key");
         dbg!(&tx);
-        tx.write();
-        tx.read();
-        tx.commit();
-        tx.validate();
+        // tx.write();
+        // tx.read();
+        // tx.commit();
+        // tx.validate();
         // assert_eq!(ob_url, "http://test_url/types/default/buckets/test_bucket/keys/test_key");
     }
 

@@ -1,14 +1,46 @@
 use crate::riak::client::RiakError;
 use base64::{engine::general_purpose, Engine as _};
 use reqwest::header::HeaderMap;
+// use multipart::server::Headers;
 
 #[derive(Debug)]
 pub struct Object {
     pub value: Vec<u8>,
-    pub vclock: VClock,
+    pub vclock: VClock,                // shared across siblings
+    pub vtag: Option<String>,          // per-sibling ETag / vtag
+    pub content_type: Option<String>,  // per-sibling Content-Type
+    pub last_modified: Option<String>, // per-sibling Last-Modified
 }
 
+impl Object {
+    pub fn new(headers: &HeaderMap, body: Vec<u8>) -> Result<Object, RiakError> {
+        let vclock = VClock::from_headers(headers)?;
 
+        let vtag = headers
+            .get("ETag")
+            .or_else(|| headers.get("Etag"))
+            .and_then(|s| s.to_str().ok())
+            .map(|s| s.to_string());
+
+        let content_type = headers
+            .get("Content-Type")
+            .and_then(|s| s.to_str().ok())
+            .map(|s| s.to_string());
+
+        let last_modified = headers
+            .get("Last-Modified")
+            .and_then(|s| s.to_str().ok())
+            .map(|s| s.to_string());
+
+        Ok(Object {
+            value: body,
+            vclock,
+            vtag,
+            content_type,
+            last_modified,
+        })
+    }
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct VClock(pub Vec<u8>);
 
