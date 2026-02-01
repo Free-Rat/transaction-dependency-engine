@@ -35,13 +35,19 @@ impl Client {
 
     // Use Riak HTTP API path with bucket types (default type used here).
     // According to Riak HTTP API: /types/<type>/buckets/<bucket>/keys/<key>
-    fn object_url(&self, bucket: &str, key: &str) -> String {
+    fn object_url(&self, bucket: Bucket, key: &str) -> String {
         // TODO: use Bucket enum
         let base = self.base_url.trim_end_matches('/');
+        let bucket = match bucket {
+            Bucket::ReadSets => "read_set",
+            Bucket::WriteSets => "write_sets",
+            Bucket::Statuses => "statuses",
+            Bucket::Variables => "variables",
+        };
         format!("{}/types/default/buckets/{}/keys/{}", base, bucket, key)
     }
 
-    pub async fn get(&self, bucket: &str, key: &str) -> Result<GetResult, RiakError> {
+    pub async fn get(&self, bucket: Bucket, key: &str) -> Result<GetResult, RiakError> {
         let url = self.object_url(bucket, key);
 
         // 1) permissive GET (no restrictive Accept)
@@ -154,7 +160,7 @@ impl Client {
 
     pub async fn put(
         &self,
-        bucket: &str,
+        bucket: Bucket,
         key: &str,
         value: Vec<u8>,
         vclock: Option<VClock>,
@@ -227,7 +233,7 @@ mod tests {
     #[test]
     fn it_works() {
         let r = Client::new("http://test_url");
-        let ob_url = r.object_url("test_bucket", "test_key");
+        let ob_url = r.object_url(Bucket::Variables, "test_key");
         dbg!(&ob_url);
         assert_eq!(ob_url, "http://test_url/types/default/buckets/test_bucket/keys/test_key");
     }

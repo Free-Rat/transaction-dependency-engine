@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use uuid::Uuid;
 use crate::riak::client::Client;
+use crate::riak::client::Bucket;
+use crate::riak::client::GetResult;
 
 #[derive(Debug)]
 enum TransactionStatus {
@@ -71,16 +73,27 @@ impl<'a> Transaction<'a> {
         // riak client put is later in commit
     }
 
-    fn find_predecessor(&self, key: &str) -> Option<Uuid> {
-        self.connection.get("status", key)
-        Some(Uuid::nil()) // TODO: real search 
-        // walidacja swojego reada, potencjalnie wiecej niz jeden rodzic
-        // confict reasolution
+    fn find_dependency(&self, key: &str) -> Option<Uuid> {
+        let GetResult(predecessors) = self.connection.get(Bucket::Statuses, key).await else {
+            return None;
+        };
+        
+        // jeśli nie ma to zracamy None
+        // walidacja swojego reada, potencjalnie wiecej niz jedna tx dla zmiennej key:
+        // dla każdej tx musimy pobrać jej rodzinów
+        // dla każdej zmiennej która występuje w read_set tych rodzicach pobieramy tx
+        // jeśli jeden to wygrywa i jeśli już nie jest approved to change_status(Approved)
+        // jeśli więcej to:
+        // 0. pomijamy jak one same sa REJECTED
+        // 1. reject wszystkie które nie zawirają naszej zmiennej key
+        // 2. reject wszystkie których którykolwiek rodzic  
+        // 3. szukamy Approved jeśli kilka to najwcześniejszego
+        // 4. jeśli nie ma approved to wybieramy tego przy pomocy choose_tx
     }
 
     fn read(&mut self, key: &str) -> Option<Vec<u8>> {
         // TODO: riak client get, without creating whole Transaciont object
-        if let Some(p_id) = self.find_predecessor(key) {
+        if let Some(p_id) = self.find_dependency(key) {
             let p_tx = Transaction::from_uuid(p_id, self.connection);
             self.read_set.insert(key.to_string(), p_id);
             p_tx.write_set.get(key).cloned()
