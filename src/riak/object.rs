@@ -1,7 +1,6 @@
 use crate::riak::client::RiakError;
 use base64::{engine::general_purpose, Engine as _};
 use reqwest::header::HeaderMap;
-// use multipart::server::Headers;
 
 #[derive(Debug)]
 pub struct Object {
@@ -41,14 +40,18 @@ impl Object {
         })
     }
 }
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VClock(pub Vec<u8>);
 
 impl VClock {
+    pub fn new() -> Self {
+        VClock(vec![0; 8]) // 8 zeros, or whatever length you want
+    }
+
     pub fn to_base64(&self) -> String {
         general_purpose::STANDARD.encode(&self.0)
     }
-
 
     pub fn from_base64(s: &str) -> Result<Self, RiakError> {
         let decoded = general_purpose::STANDARD
@@ -72,3 +75,12 @@ impl VClock {
         Ok(VClock(Vec::new()))
     }
 }
+
+impl Default for VClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+
+

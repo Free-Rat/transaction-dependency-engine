@@ -189,6 +189,39 @@ impl Client {
     }
 
     // TODO:delete
+    
+    pub async fn get_deserialized<T>(&self, bucket: Bucket, key: &str) -> Result<T, RiakError>
+where
+        T: serde::de::DeserializeOwned,
+    {
+        let obj = self.get(bucket, key).await?;
+        match obj {
+            GetResult::Single(o) => postcard::from_bytes::<T>(&o.value)
+                .map_err(|e| RiakError::Deserialization(e.to_string())),
+            GetResult::Siblings(_) => Err(RiakError::Deserialization(
+                "Multiple siblings not supported".into(),
+            )),
+        }
+    }
+
+    pub async fn get_all_deserialized<T>(&self, bucket: Bucket, key: &str) -> Result<Vec<T>, RiakError>
+where
+        T: serde::de::DeserializeOwned,
+    {
+        match self.get(bucket, key).await? {
+            GetResult::Single(obj) => {
+                let t = postcard::from_bytes::<T>(&obj.value)
+                    .map_err(|e| RiakError::Deserialization(e.to_string()))?;
+                Ok(vec![t])
+            }
+            GetResult::Siblings(objs) => objs
+                .into_iter()
+                .map(|obj| postcard::from_bytes::<T>(&obj.value)
+                    .map_err(|e| RiakError::Deserialization(e.to_string())))
+                .collect(),
+        }
+    }
+
 }
 
 use thiserror::Error;
@@ -218,6 +251,12 @@ pub enum RiakError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Deserialization Error: {0}")]
+    Deserialization(String),
+
+    #[error("Serialize Error: {0}")]
+    Serialize(String),
 }
 
 // ---------------------- TESTS ----------------------
