@@ -3,18 +3,33 @@ use uuid::Uuid;
 use crate::riak::client::Client;
 use crate::riak::client::Bucket;
 use crate::riak::client::RiakError;
-use crate::riak::client::GetResult;
 use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum TransactionStatus {
     Created   { at: DateTime<Utc> },
-    Prepared  { at: DateTime<Utc> },
+    // Prepared  { at: DateTime<Utc> },
     Proposed  { at: DateTime<Utc> },
     Approved  { at: DateTime<Utc> },
-    Committed { at: DateTime<Utc> },
+    // Committed { at: DateTime<Utc> },
     Rejected  { at: DateTime<Utc> },
+}
+
+impl TransactionStatus {
+    fn at(&self) -> DateTime<Utc> {
+        match self {
+            TransactionStatus::Created { at }
+            // | TransactionStatus::Prepared { at }
+            | TransactionStatus::Proposed { at }
+            | TransactionStatus::Approved { at }
+            | TransactionStatus::Rejected { at } => *at,
+        }
+    }
+
+    fn is_final(&self) -> bool {
+        matches!(self, TransactionStatus::Approved { .. } | TransactionStatus::Rejected { .. })
+    }
 }
 
 #[derive(Debug)]
@@ -50,7 +65,26 @@ impl<'a> Transaction<'a> {
         // let state: TransactionStatus = connection.get(Bucket::Statuses, &id.to_string()).await;
         let read_set: HashMap<String, Uuid> = connection.get_deserialized(Bucket::ReadSets, &id.to_string()).await?;
         let write_set: HashMap<String, Vec<u8>> = connection.get_deserialized(Bucket::WriteSets, &id.to_string()).await?;
-        let state: TransactionStatus = connection.get_deserialized(Bucket::Statuses, &id.to_string()).await?;
+
+        let possible_states: Vec<TransactionStatus> = connection.get_all_deserialized(Bucket::Statuses, &id.to_string()).await?;
+        let state: TransactionStatus = {
+            // wybieramy pierwszy Rejected lub Approved
+            if let Some(final_state) = possible_states
+                .iter()
+                .filter(|s| s.is_final())
+                .min_by_key(|s| s.at())
+            {
+                final_state.clone()
+            } else {
+                // jeśli nie ma to wybieramy najpóźniejszy status
+                possible_states
+                    .into_iter()
+                    .max_by_key(|s| s.at())
+                    .unwrap_or(TransactionStatus::Created {
+                        at: DateTime::<Utc>::MIN_UTC,
+                    })
+            }
+        };
 
         Ok(Self {
             id,
@@ -106,22 +140,29 @@ impl<'a> Transaction<'a> {
                 set.extend(
                     self.connection
                         .get_all_deserialized::<String>(Bucket::Variables, var)
-                    .await?
+                        .await?
                 );
             }
             set
         };
 
-        let txs: Vec<Transaction> = {
-            let mut v = Vec::new();
-            for id in tx_ids {
-                v.push({
-                    let uuid = Uuid::try_parse(&id).expect("Invalid UUId");
-                    Transaction::from_uuid(uuid, self.connection).await?
-                });
+        // let txs: Vec<Transaction> = {
+        //     let mut v = Vec::new();
+        //     for id in tx_ids {
+        //         v.push({
+        //             let uuid = Uuid::try_parse(&id).expect("Invalid UUId");
+        //             Transaction::from_uuid(uuid, self.connection).await?
+        //         });
+        //     }
+        //     v
+        // };
+        let tx_futures = tx_ids.into_iter().map(|id| {
+            let uuid = Uuid::try_parse(&id).map_err(|_| RiakError::InvalidId);
+            async move {
+                Transaction::from_uuid(uuid?, self.connection).await
             }
-            v
-        };
+        });
+        let txs: Vec<Transaction> = futures::future::try_join_all(tx_futures).await?;
 
         // jeśli jeden to wygrywa i jeśli już nie jest approved to change_status(Approved)
         if txs.len() == 1 {
@@ -130,32 +171,144 @@ impl<'a> Transaction<'a> {
             return Ok(Some(winner.id));
         }
 
+        // bierzemy wszystkich możliwych parentów pomoże nam to znaleść frontline 
+        // - nie jest to chyba jednak potrzebne 
+        // bo wystrzczy że bedziemy patrzeć czy parent jest w latest
+        // let all_parents: HashSet<Uuid> = {
+        //     let mut v = HashSet::new();
+        //     for tx in &txs {
+        //         v.extend(tx.read_set.values().copied());
+        //     }
+        //     v
+        // };
+
+        // wyfiltrowane parents pomogą znaleść które transakcjie z frontlinu są aktualne
+        let latest_parents: HashMap<String, Uuid> = {
+            // dla każdej zmiennej musimy znaleść Approved z najpóźniejszym timestampem
+            // variable -> (parent_tx_id, state_timestamp)
+            let mut latest: HashMap<String, (Uuid, DateTime<Utc>)> = HashMap::new();
+
+            for tx in &txs {
+                // only final states participate
+                if !matches!(tx.state, TransactionStatus::Approved { .. }) {
+                    continue;
+                }
+
+                let at = tx.state.at();
+
+                for (var, parent_id) in &tx.read_set {
+                    match latest.get(var) {
+                        Some((_, existing_at)) if *existing_at >= at => {
+                            // existing final state is newer → keep it
+                        }
+                        _ => {
+                            // this final state is newer → replace
+                            latest.insert(var.clone(), (*parent_id, at));
+                        }
+                    }
+                }
+            }
+
+            latest
+                .into_iter()
+                .map(|(var, (parent_id, _))| (var, parent_id))
+                .collect()
+        };
+
+
+        // let mut parent_statuses: HashMap<Uuid, TransactionStatus> = HashMap::new();
+        //
+        // for parent in &all_parents {
+        //     let status = self.connection
+        //         .get_deserialized(Bucket::Statuses, &parent.to_string())
+        //     .await?;
+        //     parent_statuses.insert(*parent, status);
+        // }
+
         // jeśli więcej to:
+        let mut potential_dependencies: Vec<Transaction> = Vec::new();
+        //
+        // Wykluczanie:
         'txs: for mut tx in txs {
             // 0. pomijamy jak one same sa REJECTED
             if matches!(tx.state, TransactionStatus::Rejected { .. }) {
                 continue;
             }
             // 1. reject wszystkie których którykolwiek rodzic jest Rejected
-            for parent_uuid in tx.read_set.values() {
-                let parent_status = self.connection.get_deserialized(Bucket::Statuses, &parent_uuid.to_string()).await?;
-                if matches!(parent_status, TransactionStatus::Rejected { .. }) {
-                    tx.reject();
-                    continue 'txs; // continue outer loop
-                }
-            }
+            //    to w sumie jest nie potrzebne bo 3.
+            //    i dobrze bo to by było bardzo bardzo kosztowne
+            // for parent_uuid in tx.read_set.values() {
+            //     let parent_status = self.connection.get_deserialized(Bucket::Statuses, &parent_uuid.to_string()).await?;
+            //     if matches!(parent_status, TransactionStatus::Rejected { .. }) {
+            //         tx.reject();
+            //         continue 'txs; // continue outer loop
+            //     }
+            // }
             // 2. reject wszystkie które nie zawirają naszej zmiennej key
             if !tx.read_set.contains_key(key) {
                 tx.reject();
                 continue 'txs;
             }
-            // TODO: 
-            // 3. szukamy Approved jeśli kilka to najwcześniejszego - nie dokończa
-            // 4. jeśli nie ma approved to wybieramy tego przy pomocy choose_tx
+
+            // 3. reject wszystkie które nie mają parenta w latest_parents dla danej zmiennej
+            match latest_parents.get(key) {
+                Some(latest_parent) => {
+                    match tx.read_set.get(key) {
+                        Some(tx_parent) if tx_parent == latest_parent => {
+                            // OK — tx is on the frontline for this key
+                        }
+                        _ => {
+                            tx.reject();
+                            continue 'txs;
+                        }
+                    }
+                }
+                None => {
+                    // no approved parent exists for this variable
+                    // TODO: co jeśli nie ma parenta i zmienna jest nowa
+                    // póki co init z T0 i zmiennymi których moża używać
+                    tx.reject();
+                    continue 'txs;
+                }
+            }
+            
+            // nie spełnił żandego warunku wyklucznia
+            // - to znaczy że jest na frontline 
+            // - jego każdy parent jest approved
+            // - jego każdy parent jest 'najświerzszy'
+            // - zawiera nasz zmienną key
+            //
+            // więc wpisujemy do grona do wyboru
+            potential_dependencies.push(tx);
         };
 
+        // jeśli nie ma to wygrywa ostatni parent dla zmiennej
+        if potential_dependencies.is_empty() {
+            let Some(&winner) = latest_parents.get(key) else {
+                return Ok(None);
+            };
+            return Ok(Some(winner));
+        }
 
-        return Ok(None);
+        // jeśli jeden to wygrywa i jeśli już nie jest approved to change_status(Approved)
+        if potential_dependencies.len() == 1 {
+            let mut winner = potential_dependencies.into_iter().next().unwrap();
+            winner.approve();
+            return Ok(Some(winner.id));
+        }
+        // Znajdowanie:
+        // 1. szukamy Approved jeśli kilka to najwcześniejszego
+        if let Some(winner) = potential_dependencies
+            .iter()
+            .filter(|tx| matches!(tx.state, TransactionStatus::Approved { .. }))
+            .min_by_key(|tx| tx.state.at())
+        {
+            return Ok(Some(winner.id));
+        }
+
+        // 2. jeśli nie ma approved to wybieramy tego przy pomocy choose_tx
+        let winner = Transaction::choose_tx(&mut potential_dependencies);
+        Ok(Some(winner))
     }
 
     // let GetResult::Siblings(possible_dependencies) = possible_dependencies else {
@@ -195,27 +348,42 @@ impl<'a> Transaction<'a> {
         // change to Aproved 
 
     }
+
+    // przyjmuje id zbioru proponowanych tx dla danej zmiennej
+    // zwraca deterministycnie ta która "wygrała"
+    // jej status zmini na 'approved'
+    // a reszcie na 'rejected'
+    fn choose_tx(txs: &mut [Transaction]) -> Uuid {
+        assert!(!txs.is_empty(), "txs must not be empty");
+
+        // deterministic target derived from "srds"
+        let target = Uuid::new_v5(&Uuid::NAMESPACE_DNS, b"srds");
+
+        let (winner_idx, _) = txs
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, tx)| uuid_distance(tx.id, target))
+            .unwrap();
+
+        let winner_id = txs[winner_idx].id;
+
+        for (i, tx) in txs.iter_mut().enumerate() {
+            if i == winner_idx {
+                tx.approve();
+            } else {
+                tx.reject();
+            }
+        }
+
+        winner_id
+    }
 }
 
-// przyjmuje id zbioru proponowanych tx dla danej zmiennej
-// zwraca ta która "wygrała"
-// jej status zmini na 'approved'
-// a reszcie na 'rejected'
-fn choose_tx(ids: Vec<Uuid>) -> Uuid {
-    let target = "srds0000-0000-0000-0000-000000000000";
-
-    ids.into_iter()
-        .min_by_key(|id| {
-            let s = id.to_string();
-
-            s.chars()
-                .zip(target.chars())
-                .map(|(a, b)| (a as i32 - b as i32).abs())
-                .sum::<i32>()
-        })
-        .expect("ids must not be empty")
+fn uuid_distance(a: Uuid, b: Uuid) -> u128 {
+    let a = a.as_u128();
+    let b = b.as_u128();
+    if a > b { a - b } else { b - a }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -257,6 +257,9 @@ pub enum RiakError {
 
     #[error("Serialize Error: {0}")]
     Serialize(String),
+
+    #[error("InvalidId")]
+    InvalidId,
 }
 
 // ---------------------- TESTS ----------------------
