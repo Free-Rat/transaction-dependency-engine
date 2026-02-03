@@ -158,6 +158,64 @@ impl Client {
         Ok(siblings)
     }
 
+
+    /// Get all siblings as deserialized values AND also return the vclock
+    /// found in the GET response headers (the vclock you should pass to a subsequent PUT).
+    pub async fn get_all_with_vclock<T>(
+        &self,
+        bucket: Bucket,
+        key: &str,
+    ) -> Result<(Vec<T>, VClock), RiakError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        match self.get(bucket, key).await? {
+            GetResult::Single(obj) => {
+                let t = postcard::from_bytes::<T>(&obj.value)
+                    .map_err(|e| RiakError::Deserialization(e.to_string()))?;
+                Ok((vec![t], obj.vclock))
+            }
+            GetResult::Siblings(objs) => {
+                if objs.is_empty() {
+                    // shouldn't happen, but handle defensively
+                    return Ok((Vec::new(), VClock(b"".to_vec())));
+                }
+                // all sibling parts come from the same GET headers, so take vclock from the first
+                let vclock = objs[0].vclock.clone();
+                let vec_t = objs
+                    .into_iter()
+                    .map(|o| postcard::from_bytes::<T>(&o.value)
+                        .map_err(|e| RiakError::Deserialization(e.to_string())))
+                    .collect::<Result<Vec<T>, RiakError>>()?;
+                Ok((vec_t, vclock))
+            }
+        }
+    }
+
+    // (optional) make your existing get_all_deserialized reuse the new function:
+    pub async fn get_all_deserialized<T>(&self, bucket: Bucket, key: &str) -> Result<Vec<T>, RiakError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let (vec_t, _vclock) = self.get_all_with_vclock::<T>(bucket, key).await?;
+        Ok(vec_t)
+    }
+
+
+    pub async fn get_deserialized<T>(&self, bucket: Bucket, key: &str) -> Result<T, RiakError>
+where
+        T: serde::de::DeserializeOwned,
+    {
+        let obj = self.get(bucket, key).await?;
+        match obj {
+            GetResult::Single(o) => postcard::from_bytes::<T>(&o.value)
+                .map_err(|e| RiakError::Deserialization(e.to_string())),
+            GetResult::Siblings(_) => Err(RiakError::Deserialization(
+                "Multiple siblings not supported".into(),
+            )),
+        }
+    }
+
     pub async fn put(
         &self,
         bucket: Bucket,
@@ -190,38 +248,6 @@ impl Client {
 
     // TODO:delete
     
-    pub async fn get_deserialized<T>(&self, bucket: Bucket, key: &str) -> Result<T, RiakError>
-where
-        T: serde::de::DeserializeOwned,
-    {
-        let obj = self.get(bucket, key).await?;
-        match obj {
-            GetResult::Single(o) => postcard::from_bytes::<T>(&o.value)
-                .map_err(|e| RiakError::Deserialization(e.to_string())),
-            GetResult::Siblings(_) => Err(RiakError::Deserialization(
-                "Multiple siblings not supported".into(),
-            )),
-        }
-    }
-
-    pub async fn get_all_deserialized<T>(&self, bucket: Bucket, key: &str) -> Result<Vec<T>, RiakError>
-where
-        T: serde::de::DeserializeOwned,
-    {
-        match self.get(bucket, key).await? {
-            GetResult::Single(obj) => {
-                let t = postcard::from_bytes::<T>(&obj.value)
-                    .map_err(|e| RiakError::Deserialization(e.to_string()))?;
-                Ok(vec![t])
-            }
-            GetResult::Siblings(objs) => objs
-                .into_iter()
-                .map(|obj| postcard::from_bytes::<T>(&obj.value)
-                    .map_err(|e| RiakError::Deserialization(e.to_string())))
-                .collect(),
-        }
-    }
-
 }
 
 use thiserror::Error;

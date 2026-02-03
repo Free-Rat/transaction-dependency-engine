@@ -3,6 +3,7 @@ use uuid::Uuid;
 use crate::riak::client::Client;
 use crate::riak::client::Bucket;
 use crate::riak::client::RiakError;
+use crate::riak::object::VClock;
 use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
 
@@ -38,6 +39,7 @@ pub struct Transaction<'a> {
     pub read_set: HashMap<String, Uuid>, // dependecy set
     pub write_set: HashMap<String, Vec<u8>>,
     pub state: TransactionStatus,
+    state_vclock: Option<VClock>,
     connection: &'a Client,
 }
 
@@ -54,7 +56,8 @@ impl<'a> Transaction<'a> {
             read_set,
             write_set,
             state,
-            connection
+            state_vclock: None,
+            connection,
         }
     }
 
@@ -66,9 +69,11 @@ impl<'a> Transaction<'a> {
         let read_set: HashMap<String, Uuid> = connection.get_deserialized(Bucket::ReadSets, &id.to_string()).await?;
         let write_set: HashMap<String, Vec<u8>> = connection.get_deserialized(Bucket::WriteSets, &id.to_string()).await?;
 
-        let possible_states: Vec<TransactionStatus> = connection.get_all_deserialized(Bucket::Statuses, &id.to_string()).await?;
+
+        // -> use new helper to get all status siblings AND the vclock
+        let (possible_states, status_vclock) = connection.get_all_with_vclock::<TransactionStatus>(Bucket::Statuses, &id.to_string()).await?;
         let state: TransactionStatus = {
-            // wybieramy pierwszy Rejected lub Approved
+            // wybieramy pierwszy Rejected lub Approved (earliest final)
             if let Some(final_state) = possible_states
                 .iter()
                 .filter(|s| s.is_final())
@@ -91,6 +96,7 @@ impl<'a> Transaction<'a> {
             read_set,
             write_set,
             state,
+            state_vclock: Some(status_vclock),
             connection
         })
     }
@@ -167,7 +173,7 @@ impl<'a> Transaction<'a> {
         // jeśli jeden to wygrywa i jeśli już nie jest approved to change_status(Approved)
         if txs.len() == 1 {
             let mut winner = txs.into_iter().next().unwrap();
-            winner.approve();
+            winner.approve().await?;
             return Ok(Some(winner.id));
         }
 
@@ -246,7 +252,7 @@ impl<'a> Transaction<'a> {
             // }
             // 2. reject wszystkie które nie zawirają naszej zmiennej key
             if !tx.read_set.contains_key(key) {
-                tx.reject();
+                tx.reject().await?;
                 continue 'txs;
             }
 
@@ -258,7 +264,12 @@ impl<'a> Transaction<'a> {
                             // OK — tx is on the frontline for this key
                         }
                         _ => {
-                            tx.reject();
+                            match tx.state {
+                                TransactionStatus::Approved { .. } => { /* older parent, not yet removed */ },
+                                _ => {
+                                    tx.reject().await?;
+                                }
+                            };
                             continue 'txs;
                         }
                     }
@@ -267,7 +278,7 @@ impl<'a> Transaction<'a> {
                     // no approved parent exists for this variable
                     // TODO: co jeśli nie ma parenta i zmienna jest nowa
                     // póki co init z T0 i zmiennymi których moża używać
-                    tx.reject();
+                    tx.reject().await?;
                     continue 'txs;
                 }
             }
@@ -293,7 +304,7 @@ impl<'a> Transaction<'a> {
         // jeśli jeden to wygrywa i jeśli już nie jest approved to change_status(Approved)
         if potential_dependencies.len() == 1 {
             let mut winner = potential_dependencies.into_iter().next().unwrap();
-            winner.approve();
+            winner.approve().await?;
             return Ok(Some(winner.id));
         }
         // Znajdowanie:
@@ -307,7 +318,7 @@ impl<'a> Transaction<'a> {
         }
 
         // 2. jeśli nie ma approved to wybieramy tego przy pomocy choose_tx
-        let winner = Transaction::choose_tx(&mut potential_dependencies);
+        let winner = Transaction::choose_tx(&mut potential_dependencies).await?;
         Ok(Some(winner))
     }
 
@@ -326,34 +337,259 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    // fn change_status(&mut self, new_status: TransactionStatus) {
-    //     // TODO: raik update
-    //     // match new_status {
-    //     // };
-    //     self.state = new_status;
-    // }
-
-    fn commit(&mut self) {
-        // change to Committed
-        // TODO: raik put for write_set
-
+    pub async fn approve(&mut self) -> Result<(), RiakError> {
+        let new_state = TransactionStatus::Approved { at: Utc::now() };
+        self.change_status(new_state).await?;
+        // remove my parent from variables for all my readed key
+        for (var, parent_id) in &self.read_set {
+            self.remove_tx_from_variable(var, *parent_id).await?;
+        }
+        Ok(())
     }
 
-    fn reject(&mut self) {
-        // change to Rejected
-
+    pub async fn reject(&mut self) -> Result<(), RiakError> {
+        let new_state = TransactionStatus::Rejected { at: Utc::now() };
+        self.change_status(new_state).await?;
+        // remove my self from variables for all my readed variables
+        for var in self.read_set.keys() {
+            self.remove_tx_from_variable(var, self.id).await?;
+        }
+        Ok(())
     }
 
-    fn approve(&mut self) {
-        // change to Aproved 
 
+    pub async fn commit(&mut self) -> Result<(), RiakError> {
+        // Persist read_set (unique key per tx.id — no vclock needed)
+        let read_bytes = postcard::to_stdvec(&self.read_set)
+            .map_err(|e| RiakError::Serialize(e.to_string()))?;
+        let _vc_rs = self
+            .connection
+            .put(Bucket::ReadSets, &self.id.to_string(), read_bytes, None)
+        .await?;
+
+        // Persist write_set (unique key per tx.id — no vclock needed)
+        let write_bytes = postcard::to_stdvec(&self.write_set)
+            .map_err(|e| RiakError::Serialize(e.to_string()))?;
+        let _vc_ws = self
+            .connection
+            .put(Bucket::WriteSets, &self.id.to_string(), write_bytes, None)
+        .await?;
+
+        // Advance status to Proposed (or Committed if you add that variant)
+        let new_status = TransactionStatus::Proposed { at: Utc::now() };
+        self.change_status(new_status).await?;
+
+        // Register this tx.id in Variables for every variable in read_set.
+        //   Use your add_variable_tx merge helper to avoid siblings.
+        //   We iterate over keys by reference to avoid moving the map.
+        for var in self.read_set.keys() {
+            // add_variable_tx returns the vclock of the Variables object after the merge;
+            // we ignore it here, but you could store or log it if desired.
+            self.add_variable_tx(var, self.id).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Add a single tx id to the Variables bucket for `var`.
+    /// Ensures deterministic serialization (sorted Vec) and retries merge if races happen.
+    pub async fn add_variable_tx(&self, var: &str, tx_id: Uuid) -> Result<VClock, RiakError> {
+        const MAX_RETRIES: usize = 3;
+
+        for _attempt in 0..MAX_RETRIES {
+            // GET siblings (each sibling deserializes to Vec<String>)
+            let (sibling_vecs, maybe_vclock): (Vec<Vec<String>>, Option<VClock>) = match 
+            self.connection.get_all_with_vclock::<Vec<String>>(Bucket::Variables, var).await
+            {
+                Ok((vecs, vc)) => (vecs, Some(vc)),
+                // treat 404 as "no object yet"
+                Err(RiakError::UnexpectedStatus(404)) => (Vec::new(), None),
+                Err(e) => return Err(e),
+            };
+
+            // Flatten siblings into a single set (union of all siblings)
+            let mut set: HashSet<String> = HashSet::new();
+            for sibling in sibling_vecs {
+                for id in sibling {
+                    set.insert(id);
+                }
+            }
+
+            // Insert our tx id
+            set.insert(tx_id.to_string());
+
+            // Deterministic ordering: sorted Vec
+            let mut out_vec: Vec<String> = set.into_iter().collect();
+            out_vec.sort();
+
+            // Serialize deterministically
+            let bytes = postcard::to_stdvec(&out_vec)
+                .map_err(|e| RiakError::Serialize(e.to_string()))?;
+
+            // PUT with previous vclock if present
+            let new_vclock = self.connection.put(
+                Bucket::Variables,
+                var,
+                bytes.clone(),
+                maybe_vclock,
+            ).await?;
+
+            // Verify stored value matches our merged set (flatten stored siblings and compare sets)
+            let (stored_sibling_vecs, _stored_vclock) =
+            match self.connection.get_all_with_vclock::<Vec<String>>(Bucket::Variables, var).await {
+                Ok((vecs, vc)) => (vecs, vc),
+                Err(e) => return Err(e),
+            };
+
+            let mut stored_set: HashSet<String> = HashSet::new();
+            for sibling in stored_sibling_vecs {
+                for id in sibling {
+                    stored_set.insert(id);
+                }
+            }
+
+            let mut stored_sorted: Vec<String> = stored_set.into_iter().collect();
+            stored_sorted.sort();
+
+            if stored_sorted == out_vec {
+                // success
+                return Ok(new_vclock);
+            }
+
+            // else: race happened — retry (loop will GET new state)
+        }
+
+        // final attempt to return authoritative vclock if our id exists
+        let (final_sibling_vecs, final_vclock) =
+        self.connection.get_all_with_vclock::<Vec<String>>(Bucket::Variables, var).await?;
+        let mut final_set = HashSet::new();
+        for sibling in final_sibling_vecs {
+            for id in sibling {
+                final_set.insert(id);
+            }
+        }
+        if final_set.contains(&tx_id.to_string()) {
+            Ok(final_vclock)
+        } else {
+            Err(RiakError::UnexpectedStatus(409)) // or a custom Conflict error
+        }
+    }
+
+    pub async fn remove_tx_from_variable(&self, var: &str, tx_id: Uuid) -> Result<VClock, RiakError> {
+        const MAX_RETRIES: usize = 3;
+
+        for _attempt in 0..MAX_RETRIES {
+            // 1) GET siblings + vclock
+            let (sibling_vecs, maybe_vclock): (Vec<Vec<String>>, Option<VClock>) = match 
+            self.connection.get_all_with_vclock::<Vec<String>>(Bucket::Variables, var).await
+            {
+                Ok((vecs, vc)) => (vecs, Some(vc)),
+                // missing key → nothing to remove
+                Err(RiakError::UnexpectedStatus(404)) => return Ok(VClock(b"".to_vec())),
+                Err(e) => return Err(e),
+            };
+
+            // 2) Flatten siblings into a set
+            let mut set: HashSet<String> = HashSet::new();
+            for sibling in sibling_vecs {
+                for id in sibling {
+                    set.insert(id);
+                }
+            }
+
+            // 3) If id not present, no-op and return current vclock
+            let tx_id_s = tx_id.to_string();
+            if !set.contains(&tx_id_s) {
+                // nothing to remove
+                if let Some(vc) = maybe_vclock {
+                    return Ok(vc);
+                } else {
+                    return Ok(VClock(b"".to_vec()));
+                }
+            }
+
+            // 4) Remove the id
+            set.remove(&tx_id_s);
+
+            // 5) Deterministic ordering: sorted Vec
+            let mut out_vec: Vec<String> = set.into_iter().collect();
+            out_vec.sort();
+
+            // 6) Serialize deterministically
+            let bytes = postcard::to_stdvec(&out_vec)
+                .map_err(|e| RiakError::Serialize(e.to_string()))?;
+
+            // 7) PUT using previous vclock if present
+            let new_vclock = self.connection.put(
+                Bucket::Variables,
+                var,
+                bytes.clone(),
+                maybe_vclock,
+            ).await?;
+
+            // 8) Verify by re-GETting and comparing merged set
+            let (stored_sibling_vecs, _stored_vclock) =
+            match self.connection.get_all_with_vclock::<Vec<String>>(Bucket::Variables, var).await {
+                Ok((vecs, vc)) => (vecs, vc),
+                Err(e) => return Err(e),
+            };
+
+            let mut stored_set: HashSet<String> = HashSet::new();
+            for sibling in stored_sibling_vecs {
+                for id in sibling {
+                    stored_set.insert(id);
+                }
+            }
+
+            let mut stored_sorted: Vec<String> = stored_set.into_iter().collect();
+            stored_sorted.sort();
+
+            if stored_sorted == out_vec {
+                // success
+                return Ok(new_vclock);
+            }
+
+            // else: a race occurred; retry
+        }
+
+        // Final check after retries: ensure tx_id no longer present and return vclock
+        let (final_sibling_vecs, final_vclock) =
+        self.connection.get_all_with_vclock::<Vec<String>>(Bucket::Variables, var).await?;
+        let mut final_set: HashSet<String> = HashSet::new();
+        for sibling in final_sibling_vecs {
+            for id in sibling {
+                final_set.insert(id);
+            }
+        }
+
+        if !final_set.contains(&tx_id.to_string()) {
+            Ok(final_vclock)
+        } else {
+            Err(RiakError::UnexpectedStatus(409))
+        }
+    }
+
+
+    async fn change_status(&mut self, new_state:TransactionStatus) -> Result<(), RiakError> {
+        let bytes = postcard::to_stdvec(&new_state)
+            .map_err(|e| RiakError::Serialize(e.to_string()))?;
+
+        let prev_vclock = self.state_vclock.take(); // consume previous vclock
+        let new_vclock = self
+            .connection
+            .put(Bucket::Statuses, &self.id.to_string(), bytes, prev_vclock)
+            .await?;
+
+        self.state = new_state;
+        self.state_vclock = Some(new_vclock);
+        Ok(())
     }
 
     // przyjmuje id zbioru proponowanych tx dla danej zmiennej
     // zwraca deterministycnie ta która "wygrała"
     // jej status zmini na 'approved'
     // a reszcie na 'rejected'
-    fn choose_tx(txs: &mut [Transaction]) -> Uuid {
+    pub async fn choose_tx(txs: &mut [Transaction<'a>]) -> Result<Uuid, RiakError> {
         assert!(!txs.is_empty(), "txs must not be empty");
 
         // deterministic target derived from "srds"
@@ -369,20 +605,18 @@ impl<'a> Transaction<'a> {
 
         for (i, tx) in txs.iter_mut().enumerate() {
             if i == winner_idx {
-                tx.approve();
+                tx.approve().await?;
             } else {
-                tx.reject();
+                tx.reject().await?;
             }
         }
 
-        winner_id
+        Ok(winner_id)
     }
 }
 
 fn uuid_distance(a: Uuid, b: Uuid) -> u128 {
-    let a = a.as_u128();
-    let b = b.as_u128();
-    if a > b { a - b } else { b - a }
+    a.as_u128().abs_diff(b.as_u128())
 }
 
 #[cfg(test)]
@@ -402,25 +636,6 @@ mod tests {
         // assert_eq!(ob_url, "http://test_url/types/default/buckets/test_bucket/keys/test_key");
     }
 
-
-    #[test]
-    fn filip_it_works() {
-
-        fn sth(a: u8) -> bool {
-            if a > 3 {
-                // let b = if a == 2 { true } else { false };
-                // b
-                match a {
-                    2 => true,
-                    _ => false
-                }
-            } else {
-                false
-            }
-        }
-
-        sth(3);
-    }
 
     // #[tokio::test]
     // async fn test_get_returns_object_with_vclock() {
