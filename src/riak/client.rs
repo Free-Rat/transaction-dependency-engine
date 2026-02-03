@@ -4,7 +4,7 @@ use reqwest::StatusCode;
 // use base64::{engine::general_purpose, Engine as _};
 use multipart::server::Multipart;
 use reqwest::header::HeaderMap;
-use std::io::{Cursor, Read};
+use std::{fmt, io::{Cursor, Read}};
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -24,6 +24,20 @@ pub enum Bucket {
     WriteSets,
     Statuses,
     Variables,
+    Test,
+}
+
+impl fmt::Display for Bucket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Bucket::ReadSets => "read_set",
+            Bucket::WriteSets => "write_sets",
+            Bucket::Statuses => "statuses",
+            Bucket::Variables => "variables",
+            Bucket::Test => "test",
+        };
+        write!(f, "{}", s)
+    }
 }
 
 impl Client {
@@ -36,14 +50,7 @@ impl Client {
     // Use Riak HTTP API path with bucket types (default type used here).
     // According to Riak HTTP API: /types/<type>/buckets/<bucket>/keys/<key>
     fn object_url(&self, bucket: Bucket, key: &str) -> String {
-        // TODO: use Bucket enum
         let base = self.base_url.trim_end_matches('/');
-        let bucket = match bucket {
-            Bucket::ReadSets => "read_set",
-            Bucket::WriteSets => "write_sets",
-            Bucket::Statuses => "statuses",
-            Bucket::Variables => "variables",
-        };
         format!("{}/types/default/buckets/{}/keys/{}", base, bucket, key)
     }
 
@@ -199,8 +206,9 @@ impl Client {
     {
         let (vec_t, _vclock) = self.get_all_with_vclock::<T>(bucket, key).await?;
         Ok(vec_t)
-    }
+    } 
 
+    // FIX: get_deserialized potrafi zaleść dependency a get_all już nie K*$#A
 
     pub async fn get_deserialized<T>(&self, bucket: Bucket, key: &str) -> Result<T, RiakError>
 where
@@ -301,15 +309,15 @@ mod tests {
     #[test]
     fn it_works() {
         let r = Client::new("http://test_url");
-        let ob_url = r.object_url(Bucket::Variables, "test_key");
+        let ob_url = r.object_url(Bucket::Test, "test_key");
         dbg!(&ob_url);
-        assert_eq!(ob_url, "http://test_url/types/default/buckets/test_bucket/keys/test_key");
+        assert_eq!(ob_url, "http://test_url/types/default/buckets/test/keys/test_key");
     }
 
     #[tokio::test]
     async fn test_get_returns_object_with_vclock() {
         let server = Server::run();
-        let bucket = "mybucket";
+        let bucket: Bucket = Bucket::Test;
         let key = "thekey";
         let body = b"hello riak".to_vec();
         let vclock = VClock(b"some-vclock-bytes".to_vec());
@@ -342,7 +350,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_sends_vclock_and_returns_new_vclock() {
         let server = Server::run();
-        let bucket = "bucket2";
+        let bucket: Bucket = Bucket::Test;
         let key = "key2";
         let value = b"payload".to_vec();
 
@@ -378,7 +386,7 @@ mod tests {
     use rand::random;
 
     const HOST: &str = "http://localhost:8098";
-    const BUCKET: &str = "testbucket";
+    const BUCKET: Bucket = Bucket::Test;
 
     #[tokio::test]
     async fn it_puts_and_gets_value_from_real_riak() {
@@ -464,7 +472,7 @@ mod tests {
         use crate::riak::object::VClock;
 
         let server = Server::run();
-        let bucket = "sibling_bucket";
+        let bucket = Bucket::Test;
         let key = "sibling_key";
         let path = format!("/types/default/buckets/{}/keys/{}", bucket, key);
 
@@ -545,7 +553,6 @@ mod tests {
         assert_eq!(siblings[1].vclock, vclock);
     }
 
-    use super::*;
     use reqwest::header::{HeaderMap, CONTENT_TYPE};
 
     #[test]
