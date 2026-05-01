@@ -404,7 +404,7 @@ async fn test_concurrent_variable_updates_merge_correctly() {
             let result = loop {
                 match tx.add_variable_tx(&var_clone, tx.id).await {
                     Ok(_) => break Ok(tx.id),
-                    Err(e) if retries > 0 => {
+                    Err(_e) if retries > 0 => {
                         retries -= 1;
                         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                         continue;
@@ -540,7 +540,8 @@ async fn test_from_uuid_selects_correct_status_from_siblings() {
     dbg!(&tx.read_set);
     dbg!(&tx.write_set);
 
-    assert!(&tx.read_set.contains_key(&genesis.id.to_string()));
+    assert!(tx.read_set.contains_key(&test_var));
+    assert_eq!(tx.read_set.get(&test_var), Some(&genesis.id));
 
     // Create Proposed status
     let proposed = TransactionStatus::Proposed { 

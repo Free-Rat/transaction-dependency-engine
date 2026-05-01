@@ -117,66 +117,70 @@ impl<'a> Transaction<'a> {
     }
 
 
-    async fn find_dependency(&self, key: &str) -> Result<Option<Uuid>, RiakError> {
-        // dostajemy liste tx_id których nie widzielimy
-        dbg!(format!("pre find_dependency start key {}", &key));
-        let possible_dependencies_ids: Vec<String> = self.connection.get_deserialized(Bucket::Variables, key).await?;
-        // let var_txs_after: Vec<String> = client.get_deserialized(Bucket::Variables, &test_var) .await .expect("get variable txs after");
+async fn find_dependency(&self, key: &str) -> Result<Option<Uuid>, RiakError> {
+        // Get all tx ids registered for this variable from the Variables bucket
+        let possible_dependencies_ids: Vec<String> = match self.connection
+            .get_all_with_vclock::<Vec<String>>(Bucket::Variables, key)
+            .await
+        {
+            Ok((vecs, _vc)) => {
+                let mut ids: Vec<String> = vecs.into_iter().flatten().collect();
+                ids.retain(|s| s != "$");
+                ids
+            }
+            Err(RiakError::UnexpectedStatus(404)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
 
-        let possible_dependencies_ids: Vec<String> = possible_dependencies_ids
-            .into_iter()
-            .filter(|s| s != "$")
-            .collect();
-
-        dbg!(format!(" possible_dependencies_ids {:?}", &possible_dependencies_ids));
-        // jeśli nie ma to zracamy None
         if possible_dependencies_ids.is_empty() {
             return Ok(None);
         }
 
-        // MARK: walidacja swojego reada, potencjalnie wiecej niz jedna tx dla zmiennej key:
-        // dla każdej tx musimy pobrać jej rodzinów i ich zmienne
+        // For each dependency, get its read_set to find parents and their variables
         let mut parents: HashSet<Uuid> = HashSet::new();
         let mut variables: HashSet<String> = HashSet::new();
 
-        dbg!("pre find_dependency start");
-        for pd_id in possible_dependencies_ids {
-            dbg!(format!("pre get_deserialized(Bucket::ReadSets, &pd_id) {}", &pd_id));
-            if pd_id == Uuid::nil().to_string() {
+        for pd_id in &possible_dependencies_ids {
+            if pd_id == &Uuid::nil().to_string() {
                 continue;
-            } 
-            let read_set_result: Vec<HashMap<String, Uuid>> = self.connection.get_deserialized(Bucket::ReadSets, &pd_id).await?;
-            for rs in read_set_result {
-                parents.extend(rs.values().cloned());
-                variables.extend(rs.keys().cloned());
             }
-        } 
-        println!("pre rodzicach pobieramy tx");
+            let read_set_result: HashMap<String, Uuid> = match self.connection
+                .get_deserialized(Bucket::ReadSets, pd_id)
+                .await
+            {
+                Ok(rs) => rs,
+                Err(RiakError::UnexpectedStatus(404)) => continue,
+                Err(e) => return Err(e),
+            };
+            parents.extend(read_set_result.values().cloned());
+            variables.extend(read_set_result.keys().cloned());
+        }
 
-        // dla każdej zmiennej która występuje w read_set tych rodzicach pobieramy tx
-        let tx_ids: HashSet<String> = {
-            let mut set = HashSet::new();
-            for var in &variables {
-                set.extend(
-                    self.connection
-                        .get_all_deserialized::<String>(Bucket::Variables, var)
-                        .await?
-                );
+        // Collect ALL tx ids: direct dependencies + transitive ones from parent variables
+        let mut all_tx_ids: HashSet<String> = possible_dependencies_ids.into_iter().collect();
+        all_tx_ids.remove(&Uuid::nil().to_string());
+
+        for var in &variables {
+            match self.connection
+                .get_all_with_vclock::<Vec<String>>(Bucket::Variables, var)
+                .await
+            {
+                Ok((sibling_vecs, _)) => {
+                    for sibling in sibling_vecs {
+                        for id in sibling {
+                            if id != "$" {
+                                all_tx_ids.insert(id);
+                            }
+                        }
+                    }
+                }
+                Err(RiakError::UnexpectedStatus(404)) => {}
+                Err(e) => return Err(e),
             }
-            set
-        };
+        }
 
-        // let txs: Vec<Transaction> = {
-        //     let mut v = Vec::new();
-        //     for id in tx_ids {
-        //         v.push({
-        //             let uuid = Uuid::try_parse(&id).expect("Invalid UUId");
-        //             Transaction::from_uuid(uuid, self.connection).await?
-        //         });
-        //     }
-        //     v
-        // };
-        let tx_futures = tx_ids.into_iter().map(|id| {
+        // Load all transactions
+        let tx_futures = all_tx_ids.into_iter().map(|id| {
             let uuid = Uuid::try_parse(&id).map_err(|_| RiakError::InvalidId);
             async move {
                 Transaction::from_uuid(uuid?, self.connection).await
@@ -184,33 +188,11 @@ impl<'a> Transaction<'a> {
         });
         let txs: Vec<Transaction> = futures::future::try_join_all(tx_futures).await?;
 
-        // jeśli jeden to wygrywa i jeśli już nie jest approved to change_status(Approved)
-        // if txs.len() == 1 {
-        //     let mut winner = txs.into_iter().next().unwrap();
-        //     winner.approve().await?;
-        //     return Ok(Some(winner.id));
-        // }
-
-        // bierzemy wszystkich możliwych parentów pomoże nam to znaleść frontline 
-        // - nie jest to chyba jednak potrzebne 
-        // bo wystrzczy że bedziemy patrzeć czy parent jest w latest
-        // let all_parents: HashSet<Uuid> = {
-        //     let mut v = HashSet::new();
-        //     for tx in &txs {
-        //         v.extend(tx.read_set.values().copied());
-        //     }
-        //     v
-        // };
-
-        println!("pre latest_parents");
-        // wyfiltrowane parents pomogą znaleść które transakcjie z frontlinu są aktualne
+        // Find the latest approved parent for each variable
         let latest_parents: HashMap<String, Uuid> = {
-            // dla każdej zmiennej musimy znaleść Approved z najpóźniejszym timestampem
-            // variable -> (parent_tx_id, state_timestamp)
             let mut latest: HashMap<String, (Uuid, DateTime<Utc>)> = HashMap::new();
 
             for tx in &txs {
-                // only final states participate
                 if !matches!(tx.state, TransactionStatus::Approved { .. }) {
                     continue;
                 }
@@ -218,12 +200,12 @@ impl<'a> Transaction<'a> {
                 let at = tx.state.at();
 
                 for (var, parent_id) in &tx.read_set {
+                    if parent_id == &Uuid::nil() {
+                        continue;
+                    }
                     match latest.get(var) {
-                        Some((_, existing_at)) if *existing_at >= at => {
-                            // existing final state is newer → keep it
-                        }
+                        Some((_, existing_at)) if *existing_at >= at => {}
                         _ => {
-                            // this final state is newer → replace
                             latest.insert(var.clone(), (*parent_id, at));
                         }
                     }
@@ -236,81 +218,52 @@ impl<'a> Transaction<'a> {
                 .collect()
         };
 
-
-        // let mut parent_statuses: HashMap<Uuid, TransactionStatus> = HashMap::new();
-        //
-        // for parent in &all_parents {
-        //     let status = self.connection
-        //         .get_deserialized(Bucket::Statuses, &parent.to_string())
-        //     .await?;
-        //     parent_statuses.insert(*parent, status);
-        // }
-
-        // jeśli więcej to:
+        // Filter and select candidates
         let mut potential_dependencies: Vec<Transaction> = Vec::new();
-        //
-        // Wykluczanie:
-        println!("pre rejcection");
+
         'txs: for mut tx in txs {
-            // 0. pomijamy jak one same sa REJECTED
+            // Skip already-rejected transactions
             if matches!(tx.state, TransactionStatus::Rejected { .. }) {
                 continue;
             }
-            // 1. reject wszystkie których którykolwiek rodzic jest Rejected
-            //    to w sumie jest nie potrzebne bo 3.
-            //    i dobrze bo to by było bardzo bardzo kosztowne
-            // for parent_uuid in tx.read_set.values() {
-            //     let parent_status = self.connection.get_deserialized(Bucket::Statuses, &parent_uuid.to_string()).await?;
-            //     if matches!(parent_status, TransactionStatus::Rejected { .. }) {
-            //         tx.reject();
-            //         continue 'txs; // continue outer loop
-            //     }
-            // }
-            // 2. reject wszystkie które nie zawirają naszej zmiennej key
-            if !tx.read_set.contains_key(key) {
+
+            // Reject if tx doesn't involve this variable at all
+            if !tx.read_set.contains_key(key) && !tx.write_set.contains_key(key) {
                 tx.reject().await?;
                 continue 'txs;
             }
 
-            // 3. reject wszystkie które nie mają parenta w latest_parents dla danej zmiennej
+            // Check if tx is on the frontline for this key
             match latest_parents.get(key) {
                 Some(latest_parent) => {
                     match tx.read_set.get(key) {
                         Some(tx_parent) if tx_parent == latest_parent => {
-                            // OK — tx is on the frontline for this key
+                            // on the frontline
                         }
-                        _ => {
-                            match tx.state {
-                                TransactionStatus::Approved { .. } => { /* older parent, not yet removed */ },
-                                _ => {
-                                    tx.reject().await?;
-                                }
-                            };
+                        Some(_) => {
+                            // not on frontline for this key
+                            if !matches!(tx.state, TransactionStatus::Approved { .. }) {
+                                tx.reject().await?;
+                            }
                             continue 'txs;
+                        }
+                        None => {
+                            // tx writes to key but doesn't read from it (genesis-like)
+                            // — skip frontline check, it's a valid candidate
                         }
                     }
                 }
                 None => {
-                    // no approved parent exists for this variable
-                    // TODO: co jeśli nie ma parenta i zmienna jest nowa
-                    // póki co init z T0 i zmiennymi których moża używać
-                    tx.reject().await?;
-                    continue 'txs;
+                    // No approved parent exists for this variable.
+                    // This means this tx is either genesis or the first writer.
+                    // It's a valid candidate — don't reject.
                 }
             }
-            
-            // nie spełnił żandego warunku wyklucznia
-            // - to znaczy że jest na frontline 
-            // - jego każdy parent jest approved
-            // - jego każdy parent jest 'najświerzszy'
-            // - zawiera nasz zmienną key
-            //
-            // więc wpisujemy do grona do wyboru
-            potential_dependencies.push(tx);
-        };
-        println!("post rejection");
 
-        // jeśli nie ma to wygrywa ostatni parent dla zmiennej
+            potential_dependencies.push(tx);
+        }
+
+        // If no candidates, return the latest approved parent for this key (if any)
         if potential_dependencies.is_empty() {
             let Some(&winner) = latest_parents.get(key) else {
                 return Ok(None);
@@ -318,14 +271,16 @@ impl<'a> Transaction<'a> {
             return Ok(Some(winner));
         }
 
-        // jeśli jeden to wygrywa i jeśli już nie jest approved to change_status(Approved)
+        // If only one candidate, approve it and return
         if potential_dependencies.len() == 1 {
             let mut winner = potential_dependencies.into_iter().next().unwrap();
-            winner.approve().await?;
+            if !matches!(winner.state, TransactionStatus::Approved { .. }) {
+                winner.approve().await?;
+            }
             return Ok(Some(winner.id));
         }
-        // Znajdowanie:
-        // 1. szukamy Approved jeśli kilka to najwcześniejszego
+
+        // Prefer the earliest Approved candidate
         if let Some(winner) = potential_dependencies
             .iter()
             .filter(|tx| matches!(tx.state, TransactionStatus::Approved { .. }))
@@ -334,7 +289,7 @@ impl<'a> Transaction<'a> {
             return Ok(Some(winner.id));
         }
 
-        // 2. jeśli nie ma approved to wybieramy tego przy pomocy choose_tx
+        // Otherwise, deterministically choose among Proposed candidates
         let winner = Transaction::choose_tx(&mut potential_dependencies).await?;
         Ok(Some(winner))
     }
@@ -344,14 +299,11 @@ impl<'a> Transaction<'a> {
     // };
 
     pub async fn read(&mut self, key: &str) -> Result<Option<Vec<u8>>, RiakError> {
-        println!("pre find_dependency");
         if let Some(p_id) = self.find_dependency(key).await? {
-            println!("post find_dependency");
             let p_tx = Transaction::from_uuid(p_id, self.connection).await?;
             self.read_set.insert(key.to_string(), p_id);
             Ok(p_tx.write_set.get(key).cloned())
         } else {
-            println!("post find_dependency");
             Ok(None)
         }
     }
@@ -414,8 +366,7 @@ impl<'a> Transaction<'a> {
     /// Ensures deterministic serialization (sorted Vec) and retries merge if races happen.
     // 2. Fix add_variable_tx to handle empty vclock properly and improve retry logic
     pub async fn add_variable_tx(&self, var: &str, tx_id: Uuid) -> Result<VClock, RiakError> {
-        const MAX_RETRIES: usize = 5; // Increase retries for high concurrency
-        dbg!(format!("add_variable_tx {} {}", var, tx_id));
+        const MAX_RETRIES: usize = 5;
 
         for attempt in 0..MAX_RETRIES {
             // GET siblings (each sibling deserializes to Vec<String>)
@@ -498,9 +449,7 @@ impl<'a> Transaction<'a> {
                 final_set.insert(id);
             }
         }
-        dbg!(&final_vclock);
         if final_set.contains(&tx_id.to_string()) {
-            dbg!(&final_vclock);
             Ok(final_vclock)
         } else {
             Err(RiakError::UnexpectedStatus(409)) // or a custom Conflict error

@@ -4,6 +4,7 @@ use httptest::{Expectation, Server};
 use httptest::matchers::{all_of, request};
 use httptest::responders;
 use uuid::Uuid;
+use chrono::Utc;
 
 use crate::riak::object::VClock;
 use crate::riak::client::{Client, Bucket};
@@ -124,7 +125,30 @@ async fn test_commit_registers_and_proposes() {
             ),
     );
 
-    // 3) PUT Statuses
+    // 3) GET Statuses -> 200 with Proposed status + vclock
+    //    change_status does a GET before PUT and a verification GET after.
+    //    Both resolve to this 200 response (httptest matches most recent first).
+    let proposed_status = TransactionStatus::Proposed { at: Utc::now() };
+    let status_bytes = postcard::to_stdvec(&proposed_status).unwrap();
+    server.expect(
+        Expectation::matching(all_of![
+            request::method("GET"),
+            request::path(format!(
+                "/types/default/buckets/{}/keys/{}",
+                Bucket::Statuses,
+                tx.id
+            ))
+        ])
+            .times(..)
+            .respond_with(
+                responders::status_code(200)
+                    .append_header("Content-Type", "application/octet-stream")
+                    .append_header("X-Riak-Vclock", v_status.to_base64())
+                    .body(status_bytes),
+            ),
+    );
+
+    // 4) PUT Statuses
     server.expect(
         Expectation::matching(all_of![
             request::method("PUT"),
@@ -141,39 +165,10 @@ async fn test_commit_registers_and_proposes() {
             ),
     );
 
-    // 4) GET initial variable -> 404
-    let var = "counter";
-    server.expect(
-        Expectation::matching(all_of![
-            request::method("GET"),
-            request::path(format!(
-                "/types/default/buckets/{}/keys/{}",
-                Bucket::Variables,
-                var
-            ))
-        ])
-            .times(..)
-            .respond_with(responders::status_code(404)),
-    );
-
-    // 5) PUT merged variable
-    server.expect(
-        Expectation::matching(all_of![
-            request::method("PUT"),
-            request::path(format!(
-                "/types/default/buckets/{}/keys/{}",
-                Bucket::Variables,
-                var
-            ))
-        ])
-            .times(..)
-            .respond_with(
-                responders::status_code(204)
-                    .append_header("X-Riak-Vclock", v_vars.to_base64()),
-            ),
-    );
-
-    // 6) GET merged variable
+    // 5) GET variable -> 200 with merged tx list
+    //    add_variable_tx does a GET, then PUT, then a verification GET.
+    //    Both GETs resolve to this 200 response (httptest matches most recent first).
+    let var = "payload";
     let stored_vec = vec![tx.id.to_string()];
     let stored_bytes = postcard::to_stdvec(&stored_vec).unwrap();
     server.expect(
@@ -191,6 +186,23 @@ async fn test_commit_registers_and_proposes() {
                     .append_header("Content-Type", "application/octet-stream")
                     .append_header("X-Riak-Vclock", v_vars.to_base64())
                     .body(stored_bytes.clone()),
+            ),
+    );
+
+    // 6) PUT merged variable
+    server.expect(
+        Expectation::matching(all_of![
+            request::method("PUT"),
+            request::path(format!(
+                "/types/default/buckets/{}/keys/{}",
+                Bucket::Variables,
+                var
+            ))
+        ])
+            .times(..)
+            .respond_with(
+                responders::status_code(204)
+                    .append_header("X-Riak-Vclock", v_vars.to_base64()),
             ),
     );
 
