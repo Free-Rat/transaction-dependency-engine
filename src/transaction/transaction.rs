@@ -118,7 +118,7 @@ impl<'a> Transaction<'a> {
 
 
 async fn find_dependency(&self, key: &str) -> Result<Option<Uuid>, RiakError> {
-        // Get all tx ids registered for this variable from the Variables bucket
+        // 1. Get all tx ids registered for this variable from the Variables bucket
         let possible_dependencies_ids: Vec<String> = match self.connection
             .get_all_with_vclock::<Vec<String>>(Bucket::Variables, key)
             .await
@@ -136,15 +136,19 @@ async fn find_dependency(&self, key: &str) -> Result<Option<Uuid>, RiakError> {
             return Ok(None);
         }
 
-        // For each dependency, get its read_set to find parents and their variables
-        let mut parents: HashSet<Uuid> = HashSet::new();
-        let mut variables: HashSet<String> = HashSet::new();
+        // 2. Collect all transaction IDs we need to load
+        let mut ids_to_load: HashSet<String> = HashSet::new();
+        for id in &possible_dependencies_ids {
+            if id != &Uuid::nil().to_string() {
+                ids_to_load.insert(id.clone());
+            }
+        }
 
         for pd_id in &possible_dependencies_ids {
             if pd_id == &Uuid::nil().to_string() {
                 continue;
             }
-            let read_set_result: HashMap<String, Uuid> = match self.connection
+            let read_set: HashMap<String, Uuid> = match self.connection
                 .get_deserialized(Bucket::ReadSets, pd_id)
                 .await
             {
@@ -152,145 +156,95 @@ async fn find_dependency(&self, key: &str) -> Result<Option<Uuid>, RiakError> {
                 Err(RiakError::UnexpectedStatus(404)) => continue,
                 Err(e) => return Err(e),
             };
-            parents.extend(read_set_result.values().cloned());
-            variables.extend(read_set_result.keys().cloned());
-        }
-
-        // Collect ALL tx ids: direct dependencies + transitive ones from parent variables
-        let mut all_tx_ids: HashSet<String> = possible_dependencies_ids.into_iter().collect();
-        all_tx_ids.remove(&Uuid::nil().to_string());
-
-        for var in &variables {
-            match self.connection
-                .get_all_with_vclock::<Vec<String>>(Bucket::Variables, var)
-                .await
-            {
-                Ok((sibling_vecs, _)) => {
-                    for sibling in sibling_vecs {
-                        for id in sibling {
-                            if id != "$" {
-                                all_tx_ids.insert(id);
-                            }
-                        }
-                    }
+            if let Some(parent_id) = read_set.get(key) {
+                if parent_id != &Uuid::nil() {
+                    ids_to_load.insert(parent_id.to_string());
                 }
-                Err(RiakError::UnexpectedStatus(404)) => {}
-                Err(e) => return Err(e),
             }
         }
 
-        // Load all transactions
-        let tx_futures = all_tx_ids.into_iter().map(|id| {
+        // 3. Load all referenced transactions
+        let tx_futures = ids_to_load.into_iter().map(|id| {
             let uuid = Uuid::try_parse(&id).map_err(|_| RiakError::InvalidId);
-            async move {
-                Transaction::from_uuid(uuid?, self.connection).await
-            }
+            async move { Transaction::from_uuid(uuid?, self.connection).await }
         });
         let txs: Vec<Transaction> = futures::future::try_join_all(tx_futures).await?;
 
-        // Find the latest approved parent for each variable
-        let latest_parents: HashMap<String, Uuid> = {
-            let mut latest: HashMap<String, (Uuid, DateTime<Utc>)> = HashMap::new();
+        // 4. Find indices of writers: txs that write to this key and are not Rejected
+        let writer_ids: HashSet<Uuid> = possible_dependencies_ids.iter()
+            .filter_map(|id| Uuid::try_parse(id).ok())
+            .filter(|id| *id != Uuid::nil())
+            .collect();
 
-            for tx in &txs {
-                if !matches!(tx.state, TransactionStatus::Approved { .. }) {
-                    continue;
-                }
+        let writer_indices: Vec<usize> = txs.iter().enumerate()
+            .filter(|(_, tx)| {
+                !matches!(tx.state, TransactionStatus::Rejected { .. })
+                    && writer_ids.contains(&tx.id)
+                    && tx.write_set.contains_key(key)
+            })
+            .map(|(i, _)| i)
+            .collect();
 
-                let at = tx.state.at();
-
-                for (var, parent_id) in &tx.read_set {
-                    if parent_id == &Uuid::nil() {
-                        continue;
-                    }
-                    match latest.get(var) {
-                        Some((_, existing_at)) if *existing_at >= at => {}
-                        _ => {
-                            latest.insert(var.clone(), (*parent_id, at));
-                        }
-                    }
-                }
-            }
-
-            latest
-                .into_iter()
-                .map(|(var, (parent_id, _))| (var, parent_id))
-                .collect()
-        };
-
-        // Filter and select candidates
-        let mut potential_dependencies: Vec<Transaction> = Vec::new();
-
-        'txs: for mut tx in txs {
-            // Skip already-rejected transactions
-            if matches!(tx.state, TransactionStatus::Rejected { .. }) {
-                continue;
-            }
-
-            // Reject if tx doesn't involve this variable at all
-            if !tx.read_set.contains_key(key) && !tx.write_set.contains_key(key) {
-                tx.reject().await?;
-                continue 'txs;
-            }
-
-            // Check if tx is on the frontline for this key
-            match latest_parents.get(key) {
-                Some(latest_parent) => {
-                    match tx.read_set.get(key) {
-                        Some(tx_parent) if tx_parent == latest_parent => {
-                            // on the frontline
-                        }
-                        Some(_) => {
-                            // not on frontline for this key
-                            if !matches!(tx.state, TransactionStatus::Approved { .. }) {
-                                tx.reject().await?;
-                            }
-                            continue 'txs;
-                        }
-                        None => {
-                            // tx writes to key but doesn't read from it (genesis-like)
-                            // — skip frontline check, it's a valid candidate
-                        }
-                    }
-                }
-                None => {
-                    // No approved parent exists for this variable.
-                    // This means this tx is either genesis or the first writer.
-                    // It's a valid candidate — don't reject.
-                }
-            }
-
-            potential_dependencies.push(tx);
+        if writer_indices.is_empty() {
+            return Ok(None);
         }
 
-        // If no candidates, return the latest approved parent for this key (if any)
-        if potential_dependencies.is_empty() {
-            let Some(&winner) = latest_parents.get(key) else {
-                return Ok(None);
-            };
-            return Ok(Some(winner));
+        // 5. Find "tip" writers: those not depended upon by other writers for this key.
+        let writer_id_set: HashSet<Uuid> = writer_indices.iter()
+            .map(|&i| txs[i].id)
+            .collect();
+
+        let mut parent_ids_in_chain: HashSet<Uuid> = HashSet::new();
+        for &i in &writer_indices {
+            if let Some(parent_id) = txs[i].read_set.get(key) {
+                if writer_id_set.contains(parent_id) {
+                    parent_ids_in_chain.insert(*parent_id);
+                }
+            }
         }
 
-        // If only one candidate, approve it and return
-        if potential_dependencies.len() == 1 {
-            let mut winner = potential_dependencies.into_iter().next().unwrap();
-            if !matches!(winner.state, TransactionStatus::Approved { .. }) {
+        let tip_indices: Vec<usize> = writer_indices.into_iter()
+            .filter(|&i| !parent_ids_in_chain.contains(&txs[i].id))
+            .collect();
+
+        if tip_indices.is_empty() {
+            // Fallback: return the latest Approved writer
+            if let Some(approved) = txs.iter()
+                .filter(|tx| matches!(tx.state, TransactionStatus::Approved { .. }))
+                .filter(|tx| tx.write_set.contains_key(key))
+                .max_by_key(|tx| tx.state.at())
+            {
+                return Ok(Some(approved.id));
+            }
+            return Ok(None);
+        }
+
+        // 6. If single tip, auto-approve if Proposed and return
+        if tip_indices.len() == 1 {
+            let idx = tip_indices[0];
+            let winner_id = txs[idx].id;
+            if !matches!(txs[idx].state, TransactionStatus::Approved { .. }) {
+                // Need to approve - reload, mutate, return id
+                let mut winner = Transaction::from_uuid(winner_id, self.connection).await?;
                 winner.approve().await?;
             }
-            return Ok(Some(winner.id));
+            return Ok(Some(winner_id));
         }
 
-        // Prefer the earliest Approved candidate
-        if let Some(winner) = potential_dependencies
-            .iter()
-            .filter(|tx| matches!(tx.state, TransactionStatus::Approved { .. }))
-            .min_by_key(|tx| tx.state.at())
-        {
-            return Ok(Some(winner.id));
+        // 7. Among multiple tips, prefer an Approved one (no side effects)
+        let approved_tip_idx = tip_indices.iter()
+            .filter(|&&i| matches!(txs[i].state, TransactionStatus::Approved { .. }))
+            .min_by_key(|&&i| txs[i].state.at());
+        if let Some(&idx) = approved_tip_idx {
+            return Ok(Some(txs[idx].id));
         }
 
-        // Otherwise, deterministically choose among Proposed candidates
-        let winner = Transaction::choose_tx(&mut potential_dependencies).await?;
+        // 8. Multiple Proposed tips — resolve conflict via choose_tx
+        let tip_futures = tip_indices.into_iter().map(|i| {
+            Transaction::from_uuid(txs[i].id, self.connection)
+        });
+        let mut tips: Vec<Transaction> = futures::future::try_join_all(tip_futures).await?;
+        let winner = Transaction::choose_tx(&mut tips).await?;
         Ok(Some(winner))
     }
 
