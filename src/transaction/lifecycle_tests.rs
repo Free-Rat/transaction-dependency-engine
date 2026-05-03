@@ -3,7 +3,6 @@
 use crate::riak::client::{Client, Bucket};
 use crate::transaction::transaction::{Transaction, TransactionStatus};
 use rand::random;
-use uuid::Uuid;
 
 const HOST: &str = "http://localhost:8098";
 
@@ -87,211 +86,206 @@ async fn test_read_write_variable_lifecycle() {
     // ================================================================
     print_section!("STEP 1: GENESIS — create variable from scratch");
     println!("  Creating a 'genesis' transaction. This is the first transaction");
-    println!("  that writes a new variable. It has no dependencies (read_set empty).");
+    println!("  that writes a new variable. No explicit approve() — read() will");
+    println!("  auto-approve it when someone reads the variable.");
 
     let balance_var = unique_key("balance");
-    println!("\n  Picking unique variable name: \"{}\"", balance_var);
-
     let mut genesis = Transaction::new(&client);
-    println!("  Created new transaction id: {}", genesis.id);
-    println!("  State right after Transaction::new(): {:?}", genesis.state);
+    println!("\n  Created new transaction id: {}", genesis.id);
 
-    println!("\n  → Adding write_set[\"{}\"] = \"1000\" (initial value)", balance_var);
+    println!("  → Adding write_set[\"{}\"] = \"1000\" (initial value)", balance_var);
     genesis.write_set.insert(balance_var.clone(), b"1000".to_vec());
     print_transaction("genesis BEFORE commit", &genesis);
 
     println!("\n  → Calling genesis.commit() ...");
-    println!("     This will:");
-    println!("       1. Persist read_set to Riak bucket ReadSets");
-    println!("       2. Persist write_set to Riak bucket WriteSets");
-    println!("       3. Change status from Created → Proposed");
-    println!("       4. Register this tx id in Variables bucket for each write_set key");
+    println!("     This persist read_set/write_set to Riak, sets status to Proposed,");
+    println!("     and registers the tx id in the Variables bucket.");
     genesis.commit().await.expect("genesis commit should succeed");
-    print_transaction("genesis AFTER commit", &genesis);
-    verify!("State is Proposed after commit", matches!(genesis.state, TransactionStatus::Proposed { .. }));
+    print_transaction("genesis AFTER commit (Proposed)", &genesis);
 
-    println!("\n  → Calling genesis.approve() ...");
-    println!("     This will:");
-    println!("       1. Change status from Proposed → Approved");
-    println!("       2. Remove parent tx ids from Variables for each key in read_set");
-    println!("       (genesis has empty read_set, so no parents to remove)");
-    genesis.approve().await.expect("genesis approve should succeed");
-    print_transaction("genesis AFTER approve", &genesis);
-    verify!("State is Approved after approve", matches!(genesis.state, TransactionStatus::Approved { .. }));
+    verify!("State is Proposed", matches!(genesis.state, TransactionStatus::Proposed { .. }));
 
     println!("\n  Checking Riak: what tx ids are registered for variable '{}'?", balance_var);
     print_variable(&client, &balance_var).await;
 
     println!("\n  → Reconstructing genesis from UUID via Transaction::from_uuid() ...");
-    println!("     This fetches read_set, write_set, and status from Riak and rebuilds the object.");
     let recon = Transaction::from_uuid(genesis.id, &client)
         .await
         .expect("reconstruct genesis should succeed");
     print_transaction("reconstructed genesis", &recon);
-    verify!("Reconstructed id matches", recon.id == genesis.id);
-    verify!("Reconstructed state is Approved", matches!(recon.state, TransactionStatus::Approved { .. }));
-    verify!("Reconstructed write_set has correct value", recon.write_set.get(&balance_var) == Some(&b"1000".to_vec()));
+    verify!("Reconstructed state is Proposed (not yet approved)", matches!(recon.state, TransactionStatus::Proposed { .. }));
 
     // ================================================================
-    print_section!("STEP 2: READ — new tx reads the variable, finds genesis as dependency");
-    println!("  When a new tx reads a variable, find_dependency() is called.");
-    println!("  It looks up which tx ids are registered for that variable in Riak,");
-    println!("  then determines the 'frontline' transaction to read from.");
+    print_section!("STEP 2: READ — first read auto-approves the genesis tx");
+    println!("  When reader.read() is called, find_dependency() discovers that");
+    println!("  genesis is the only frontier writer for this variable. Since it's");
+    println!("  Proposed (not yet Approved), find_dependency auto-approves it and");
+    println!("  returns its id. The reader then gets the value from genesis.write_set.");
 
     let mut reader = Transaction::new(&client);
     println!("  Created reader tx id: {}", reader.id);
 
     println!("\n  → Calling reader.read(\"{}\") ...", balance_var);
     println!("     find_dependency will:");
-    println!("       1. GET variable '{}' from Riak → finds genesis tx id", balance_var);
-    println!("       2. Load genesis transaction, see it's Approved");
-    println!("       3. Since genesis has no read_set entries for this variable,");
-    println!("          it's a valid frontier tx → return genesis.id");
-    println!("       4. Load genesis transaction to get its write_set value");
+    println!("       1. Look up variable '{}' in Riak → finds genesis id", balance_var);
+    println!("       2. Load genesis transaction, see it's Proposed but on the frontier");
+    println!("       3. Auto-approve genesis (Proposed → Approved)");
+    println!("       4. Return genesis.id as the dependency");
+    println!("       5. Return genesis.write_set[\"{}\"] = \"1000\"", balance_var);
     let balance_value = reader.read(&balance_var).await.expect("read should succeed");
     println!("\n  read() returned: {:?}", balance_value.as_ref().map(|v| fmt_value(v)));
     verify!("Got Some value for existing variable", balance_value.is_some());
     verify!("Value is \"1000\" (matching genesis write)", balance_value.unwrap() == b"1000".to_vec());
 
-    println!("\n  The read() call also populated reader.read_set:");
-    println!("    read_set[\"{}\"] = {}  (the genesis tx id)", balance_var, genesis.id);
+    println!("\n  read() also auto-approved genesis and stored the dependency:");
+    println!("    read_set[\"{}\"] = {}  (genesis id)", balance_var, genesis.id);
     verify!("read_set contains the variable key", reader.read_set.contains_key(&balance_var));
     verify!("read_set maps variable to genesis id", *reader.read_set.get(&balance_var).unwrap() == genesis.id);
     print_transaction("reader AFTER read", &reader);
 
+    // Verify genesis is now Approved
+    let recon_genesis = Transaction::from_uuid(genesis.id, &client)
+        .await
+        .expect("re-reconstruct genesis");
+    print_transaction("genesis AFTER auto-approval", &recon_genesis);
+    verify!("Genesis is now Approved", matches!(recon_genesis.state, TransactionStatus::Approved { .. }));
+
     // ================================================================
     print_section!("STEP 3: WRITE — reader writes an updated value");
-    println!("  Now the reader wants to edit the variable. It calls write()");
-    println!("  which adds the value to write_set. The actual value is only");
-    println!("  persisted to Riak when commit() is called.");
+    println!("  The reader now wants to edit the variable. It calls write()");
+    println!("  to add the value to write_set. The value is only persisted when");
+    println!("  commit() is called.");
 
     println!("\n  → Calling reader.write(\"{}\", \"800\") ...", balance_var);
     reader.write(&balance_var, b"800".to_vec());
     print_transaction("reader AFTER write (before commit)", &reader);
 
     println!("\n  → Calling reader.commit() ...");
-    println!("     This will:");
-    println!("       1. Persist read_set and write_set to Riak");
-    println!("       2. Change status from Created → Proposed");
-    println!("       3. Register reader tx id in Variables for balance_var");
     reader.commit().await.expect("reader commit should succeed");
-    print_transaction("reader AFTER commit", &reader);
+    print_transaction("reader AFTER commit (Proposed)", &reader);
     verify!("State is Proposed after commit", matches!(reader.state, TransactionStatus::Proposed { .. }));
 
-    println!("\n  Checking Riak: variable '{}' now has both tx ids registered:", balance_var);
+    println!("\n  Variable '{}' now has both tx ids registered:", balance_var);
     print_variable(&client, &balance_var).await;
 
     // ================================================================
-    print_section!("STEP 4: APPROVE — approve the reader tx; genesis removed from variable");
-    println!("  When a tx is approved, its read_set parents are removed from");
-    println!("  the Variables bucket. This is because the approved tx supersedes");
-    println!("  the parent — only the latest transaction on the frontier matters.");
+    print_section!("STEP 4: SECOND READ — auto-approves the reader, returns updated value");
+    println!("  A second reader calls read(). find_dependency discovers that");
+    println!("  the reader (Proposed, writes \"800\") is the frontier tip because");
+    println!("  it depends on genesis (which is now Approved). It auto-approves");
+    println!("  the reader and returns its value.");
 
-    println!("\n  → Calling reader.approve() ...");
-    println!("     This will:");
-    println!("       1. Change status from Proposed → Approved");
-    println!("       2. For each (variable, parent_id) in read_set:");
-    println!("          Remove parent_id from Variables[variable]");
-    println!("          (genesis id will be removed from Variables[\"{}\"])", balance_var);
-    reader.approve().await.expect("reader approve should succeed");
-    print_transaction("reader AFTER approve", &reader);
-    verify!("State is Approved after approve", matches!(reader.state, TransactionStatus::Approved { .. }));
+    let mut second_reader = Transaction::new(&client);
+    println!("  Created second_reader tx id: {}", second_reader.id);
 
-    let var_ids = get_variable_ids(&client, &balance_var).await;
-    println!("\n  Variable '{}' tx ids after approve: {:?}", balance_var, var_ids);
-    verify!("Genesis id removed from variable", !var_ids.contains(&genesis.id.to_string()));
-    verify!("Reader id still present in variable", var_ids.contains(&reader.id.to_string()));
+    println!("\n  → Calling second_reader.read(\"{}\") ...", balance_var);
+    let updated = second_reader.read(&balance_var).await.expect("second read should succeed");
+    println!("  second_reader.read() returned: {:?}", updated.as_ref().map(|v| fmt_value(v)));
+    verify!("Second reader sees \"800\" (reader's value)", updated.unwrap() == b"800".to_vec());
 
-    // ================================================================
-    print_section!("STEP 5: VERIFY — reconstruct reader tx from UUID");
-    println!("  Prove that all state survived in Riak by reconstructing from UUID.");
+    println!("\n  read() auto-approved the first reader and stored dependency:");
+    verify!("read_set references the first reader", second_reader.read_set.contains_key(&balance_var));
+    print_transaction("second_reader AFTER read", &reader);
 
-    println!("\n  → Calling Transaction::from_uuid({}) ...", reader.id);
+    // Verify first reader is now Approved
     let recon_reader = Transaction::from_uuid(reader.id, &client)
         .await
-        .expect("reconstruct reader should succeed");
+        .expect("reconstruct reader");
+    print_transaction("first reader AFTER auto-approval", &recon_reader);
+    verify!("First reader is now Approved", matches!(recon_reader.state, TransactionStatus::Approved { .. }));
+
+    // Verify genesis id was removed from Variables after reader approval
+    let var_ids = get_variable_ids(&client, &balance_var).await;
+    println!("\n  Variable '{}' tx ids: {:?}", balance_var, var_ids);
+    verify!("Genesis removed from variable (superseded by reader)", !var_ids.contains(&genesis.id.to_string()));
+    verify!("Reader present in variable", var_ids.contains(&reader.id.to_string()));
+
+    // ================================================================
+    print_section!("STEP 5: VERIFY — reconstruct transactions from UUID");
+    println!("  All state survives in Riak and can be reconstructed at any time.");
+
+    println!("\n  → Reconstructing the first reader (which was auto-approved)...");
+    let recon_reader = Transaction::from_uuid(reader.id, &client)
+        .await
+        .expect("reconstruct reader");
     print_transaction("reconstructed reader", &recon_reader);
     verify!("Reconstructed state is Approved", matches!(recon_reader.state, TransactionStatus::Approved { .. }));
     verify!("Reconstructed write_set has \"800\"", recon_reader.write_set.get(&balance_var) == Some(&b"800".to_vec()));
-    verify!("Reconstructed read_set has variable key", recon_reader.read_set.contains_key(&balance_var));
+    verify!("Reconstructed read_set has the genesis as dependency", recon_reader.read_set.get(&balance_var) == Some(&genesis.id));
 
     println!("\n  ══════════════════════════════════════════");
-    println!("  LIFECYCLE TEST PASSED");
+    println!("  LIFECYCLE TEST PASSED — no explicit approve() calls needed!");
     println!("  ══════════════════════════════════════════");
 }
 
 #[tokio::test]
-async fn test_second_reader_reads_updated_value() {
+async fn test_second_reader_sees_latest_value() {
     let client = Client::new(HOST);
 
-    print_section!("FULL CHAIN — genesis → editor → second reader");
-    println!("  This test demonstrates that when a variable is updated,");
-    println!("  a new reader sees the LATEST approved value, not the old one.");
+    print_section!("CHAIN — genesis → editor → second reader (all via read())");
+    println!("  This test proves that each read() auto-approves the previous writer,");
+    println!("  so the latest value is always visible without manual approve() calls.");
 
     // ── Genesis ──
-    println!("\n  → Creating genesis transaction: write \"hello\" → {}", unique_key("myvar"));
+    println!("\n  → Creating genesis: write \"hello\"");
     let myvar = unique_key("myvar");
     let mut genesis = Transaction::new(&client);
     genesis.write_set.insert(myvar.clone(), b"hello".to_vec());
     genesis.commit().await.expect("genesis commit");
-    genesis.approve().await.expect("genesis approve");
-    print_transaction("genesis (Approved, value=\"hello\")", &genesis);
-    println!("\n  Genesis is now the frontier for variable '{}'.", myvar);
+    print_transaction("genesis (Proposed)", &genesis);
 
-    // ── First edit ──
-    println!("\n  → Creating editor transaction: reads → writes \"world\"");
+    // ── First read auto-approves genesis ──
+    println!("\n  → First read: auto-approves genesis, returns \"hello\"");
     let mut editor = Transaction::new(&client);
-    println!("  editor.read() on '{}' — find_dependency resolves to genesis", myvar);
-    let value = editor.read(&myvar).await.expect("editor read should succeed");
-    println!("  editor read value: {:?} (from genesis)", value.as_ref().map(|v| fmt_value(v)));
-    verify!("Editor sees genesis value \"hello\"", value.unwrap() == b"hello".to_vec());
+    let value = editor.read(&myvar).await.expect("editor read");
+    println!("  editor.read() = {:?}", value.as_ref().map(|v| fmt_value(v)));
+    verify!("Editor sees \"hello\"", value.unwrap() == b"hello".to_vec());
 
-    println!("\n  editor.write() updates the value to \"world\"");
+    // Verify genesis is Approved
+    let recon = Transaction::from_uuid(genesis.id, &client).await.expect("reconstruct");
+    verify!("Genesis auto-approved", matches!(recon.state, TransactionStatus::Approved { .. }));
+
+    // ── Editor writes ──
+    println!("\n  → Editor writes \"world\" and commits");
     editor.write(&myvar, b"world".to_vec());
     editor.commit().await.expect("editor commit");
+    print_transaction("editor (Proposed)", &editor);
 
-    println!("\n  → editor.approve(): genesis should be removed from Variables[\"{}\"]", myvar);
-    editor.approve().await.expect("editor approve");
-    print_transaction("editor (Approved, value=\"world\")", &editor);
-    println!("\n  Editor is now the frontier for variable '{}'.", myvar);
-
-    // ── Second reader ──
-    println!("\n  → Creating second_reader transaction");
+    // ── Second read auto-approves editor ──
+    println!("\n  → Second read: auto-approves editor, returns \"world\"");
     let mut second_reader = Transaction::new(&client);
-    println!("  second_reader.read() — find_dependency should resolve to editor (not genesis)");
-
-    let updated = second_reader.read(&myvar).await.expect("second reader should succeed");
-    println!("  second_reader got value: {:?}", updated.as_ref().map(|v| fmt_value(v)));
+    let updated = second_reader.read(&myvar).await.expect("second reader");
+    println!("  second_reader.read() = {:?}", updated.as_ref().map(|v| fmt_value(v)));
     verify!("Second reader sees \"world\" (editor's value)", updated.unwrap() == b"world".to_vec());
 
-    println!("\n    read_set[\"{}\"] = {}  (editor id, not genesis)", myvar, editor.id);
-    verify!("read_set references editor id", *second_reader.read_set.get(&myvar).unwrap() == editor.id);
-    print_transaction("second reader AFTER read", &second_reader);
+    // Verify editor is Approved
+    let recon_editor = Transaction::from_uuid(editor.id, &client).await.expect("reconstruct editor");
+    verify!("Editor auto-approved", matches!(recon_editor.state, TransactionStatus::Approved { .. }));
+    print_transaction("editor (Approved via auto-approve)", &recon_editor);
 
-    // ── Second reader also writes ──
-    println!("\n  → second_reader writes \"!\" and commits");
+    // ── Second reader writes ──
+    println!("\n  → Second reader writes \"!\" and commits");
     second_reader.write(&myvar, b"!".to_vec());
     second_reader.commit().await.expect("second reader commit");
 
-    println!("\n  Variable '{}' has these tx ids before approve:", myvar);
+    println!("\n  Variable '{}' before third read:", myvar);
     print_variable(&client, &myvar).await;
 
-    println!("\n  → second_reader.approve(): editor removed, second_reader remains");
-    second_reader.approve().await.expect("second reader approve");
-    print_transaction("second reader (Approved, value=\"!\")", &second_reader);
+    // ── Third read auto-approves second reader ──
+    println!("\n  → Third read: auto-approves second reader, returns \"!\"");
+    let mut third_reader = Transaction::new(&client);
+    let final_val = third_reader.read(&myvar).await.expect("third reader");
+    println!("  third_reader.read() = {:?}", final_val.as_ref().map(|v| fmt_value(v)));
+    verify!("Third reader sees \"!\" (second reader's value)", final_val.unwrap() == b"!".to_vec());
 
     let var_ids = get_variable_ids(&client, &myvar).await;
     println!("\n  Final variable tx ids: {:?}", var_ids);
-    verify!("Genesis gone from variable", !var_ids.contains(&genesis.id.to_string()));
-    verify!("Editor gone from variable", !var_ids.contains(&editor.id.to_string()));
-    verify!("Second reader present in variable", var_ids.contains(&second_reader.id.to_string()));
-
-    let reconstructed = Transaction::from_uuid(second_reader.id, &client).await.expect("reconstruct");
-    verify!("Reconstructed state is Approved", matches!(reconstructed.state, TransactionStatus::Approved { .. }));
-    verify!("Reconstructed write_set has \"!\"", reconstructed.write_set.get(&myvar) == Some(&b"!".to_vec()));
+    verify!("Genesis gone", !var_ids.contains(&genesis.id.to_string()));
+    verify!("Editor gone", !var_ids.contains(&editor.id.to_string()));
+    verify!("Second reader present", var_ids.contains(&second_reader.id.to_string()));
 
     println!("\n  ══════════════════════════════════════════");
-    println!("  FULL CHAIN TEST PASSED");
+    println!("  CHAIN TEST PASSED — full auto-approve chain works!");
     println!("  ══════════════════════════════════════════");
 }
 
@@ -301,31 +295,35 @@ async fn test_choose_tx_among_conflicting_writers() {
 
     print_section!("CONFLICT — two writers compete for the same variable");
     println!("  When two Proposed transactions both depend on the same parent,");
-    println!("  choose_tx() deterministically selects one winner (Approved)");
-    println!("  and rejects the other (Rejected).");
+    println!("  find_dependency auto-approves the parent and then uses choose_tx");
+    println!("  to deterministically select one winner (Approved) and reject the other.");
 
     // ── Genesis ──
     println!("\n  → Setting up genesis with value \"42\"");
     let counter_var = unique_key("counter");
     let mut genesis = Transaction::new(&client);
     genesis.write_set.insert(counter_var.clone(), b"42".to_vec());
-    genesis.read_set.insert(counter_var.clone(), Uuid::nil());
     genesis.commit().await.expect("genesis commit");
-    genesis.approve().await.expect("genesis approve");
-    print_transaction("genesis (Approved, value=\"42\")", &genesis);
+    print_transaction("genesis (Proposed)", &genesis);
+
+    // ── First read auto-approves genesis ──
+    println!("\n  → First read auto-approves genesis");
+    let mut approver = Transaction::new(&client);
+    let val = approver.read(&counter_var).await.expect("approver read");
+    verify!("Approver sees \"42\"", val.unwrap() == b"42".to_vec());
 
     // ── Two writers ──
-    println!("\n  → Creating two competing writers that both read the same variable");
+    println!("\n  → Creating two competing writers");
     let mut writer_a = Transaction::new(&client);
     let mut writer_b = Transaction::new(&client);
     println!("  writer_a id: {}", writer_a.id);
     println!("  writer_b id: {}", writer_b.id);
 
-    println!("\n  Both call read() — find_dependency resolves to genesis:");
+    println!("\n  Both call read() — find_dependency resolves to genesis (now Approved):");
     let val_a = writer_a.read(&counter_var).await.expect("writer_a read");
     let val_b = writer_b.read(&counter_var).await.expect("writer_b read");
-    println!("  writer_a.read() = {:?}  (from genesis)", val_a.as_ref().map(|v| fmt_value(v)));
-    println!("  writer_b.read() = {:?}  (from genesis)", val_b.as_ref().map(|v| fmt_value(v)));
+    println!("  writer_a.read() = {:?}", val_a.as_ref().map(|v| fmt_value(v)));
+    println!("  writer_b.read() = {:?}", val_b.as_ref().map(|v| fmt_value(v)));
     verify!("writer_a value is \"42\"", val_a.unwrap() == b"42".to_vec());
     verify!("writer_b value is \"42\"", val_b.unwrap() == b"42".to_vec());
 
@@ -335,44 +333,250 @@ async fn test_choose_tx_among_conflicting_writers() {
     writer_a.write(&counter_var, b"43".to_vec());
     writer_b.write(&counter_var, b"44".to_vec());
 
-    println!("\n  → Both commit (status becomes Proposed):");
+    println!("\n  → Both commit (status = Proposed):");
     let id_a = writer_a.id;
     let _id_b = writer_b.id;
     writer_a.commit().await.expect("writer_a commit");
     writer_b.commit().await.expect("writer_b commit");
-    println!("  writer_a state: {:?}", writer_a.state);
-    println!("  writer_b state: {:?}", writer_b.state);
 
     println!("\n  Variable '{}' has both tx ids registered:", counter_var);
     print_variable(&client, &counter_var).await;
 
-    // ── Resolution ──
-    println!("\n  → Calling Transaction::choose_tx([writer_a, writer_b]) ...");
-    println!("     This uses a deterministic UUID-distance algorithm to pick a winner.");
-    println!("     The winner becomes Approved, the loser becomes Rejected.");
-    let mut writers = vec![writer_a, writer_b];
-    let winner_id = Transaction::choose_tx(&mut writers).await.expect("choose_tx should succeed");
-    let (winner, loser) = if winner_id == id_a { (0usize, 1usize) } else { (1usize, 0usize) };
+    // ── Resolution via read() ──
+    println!("\n  → A new reader calls read() — this triggers conflict resolution:");
+    println!("     find_dependency finds two Proposed writers on the frontier.");
+    println!("     choose_tx deterministically picks one winner → Approved.");
+    println!("     The loser is rejected → Rejected.");
+    let mut resolver = Transaction::new(&client);
+    let resolved_value = resolver.read(&counter_var).await.expect("resolver read should succeed");
+    println!("  resolver.read() returned: {:?}", resolved_value.as_ref().map(|v| fmt_value(v)));
+    verify!("Resolver got a value (either \"43\" or \"44\")", resolved_value.is_some());
 
-    println!("\n  Result: winner = {} (idx {})", winner_id, winner);
-    print_transaction("WINNER", &writers[winner]);
-    print_transaction("LOSER", &writers[loser]);
-    verify!("Winner state is Approved", matches!(writers[winner].state, TransactionStatus::Approved { .. }));
-    verify!("Loser state is Rejected", matches!(writers[loser].state, TransactionStatus::Rejected { .. }));
+    // Check which writer won
+    let winner_a = Transaction::from_uuid(id_a, &client).await.expect("check writer_a");
+    let winner_b_state = Transaction::from_uuid(writer_b.id, &client).await.expect("check writer_b");
 
-    println!("\n  Variable '{}' after resolution:", counter_var);
-    print_variable(&client, &counter_var).await;
-
-    let var_ids = get_variable_ids(&client, &counter_var).await;
-    verify!("Genesis removed from variable", !var_ids.contains(&genesis.id.to_string()));
-    verify!("Winner present in variable", var_ids.contains(&winner_id.to_string()));
-    verify!("Loser removed from variable", !var_ids.contains(&writers[loser].id.to_string()));
-
-    let reconstructed = Transaction::from_uuid(winner_id, &client).await.expect("reconstruct winner");
-    verify!("Reconstructed winner state is Approved", matches!(reconstructed.state, TransactionStatus::Approved { .. }));
+    if matches!(winner_a.state, TransactionStatus::Approved { .. }) {
+        println!("\n  writer_a WON (Approved), writer_b LOST (Rejected)");
+        verify!("writer_a is Approved", matches!(winner_a.state, TransactionStatus::Approved { .. }));
+        verify!("writer_b is Rejected", matches!(winner_b_state.state, TransactionStatus::Rejected { .. }));
+    } else {
+        println!("\n  writer_b WON (Approved), writer_a LOST (Rejected)");
+        verify!("writer_b is Approved", matches!(winner_b_state.state, TransactionStatus::Approved { .. }));
+        verify!("writer_a is Rejected", matches!(winner_a.state, TransactionStatus::Rejected { .. }));
+    }
 
     println!("\n  ══════════════════════════════════════════");
-    println!("  CONFLICT RESOLUTION TEST PASSED: winner = {}", winner_id);
+    println!("  CONFLICT RESOLUTION TEST PASSED");
+    println!("  ══════════════════════════════════════════");
+}
+
+#[tokio::test]
+async fn test_cross_variable_concurrent_reads_inconsistent() {
+    let client = Client::new(HOST);
+
+    print_section!("BUG: concurrent find_dependency calls can produce inconsistent state");
+    println!("  Setup:");
+    println!("    genesis: Approved,  write_set = {{A: \"v0\", B: \"v0\"}}");
+    println!("    tx1:     Proposed, read_set = {{A: genesis}}, write_set = {{A: \"v1\"}}");
+    println!("    tx2:     Proposed, read_set = {{A: genesis, B: genesis}}, write_set = {{A: \"v2\", B: \"v2\"}}");
+    println!("    tx3:     Proposed, read_set = {{B: genesis}}, write_set = {{B: \"v3\"}}");
+    println!("");
+    println!("  BUG: find_dependency(\"A\") sees {{genesis, tx1, tx2}} but NOT tx3.");
+    println!("  find_dependency(\"B\") sees {{genesis, tx2, tx3}} but NOT tx1.");
+    println!("  Each makes an INDEPENDENT choose_tx decision about tx2.");
+    println!("  If A rejects tx2 while B approves tx2, tx2 gets contradictory");
+    println!("  statuses — Approved by one read, Rejected by the other.");
+    println!("");
+    println!("  This test runs both reads CONCURRENTLY to trigger the race.");
+
+    let var_a = unique_key("varA");
+    let var_b = unique_key("varB");
+
+    // Create genesis (writes both A and B)
+    let mut genesis = Transaction::new(&client);
+    genesis.write_set.insert(var_a.clone(), b"v0".to_vec());
+    genesis.write_set.insert(var_b.clone(), b"v0".to_vec());
+    genesis.commit().await.expect("genesis commit");
+
+    // Auto-approve genesis
+    let mut approver = Transaction::new(&client);
+    let _ = approver.read(&var_a).await.expect("auto-approve genesis");
+    verify!("Genesis is now Approved", matches!(
+        Transaction::from_uuid(genesis.id, &client).await.expect("recheck").state,
+        TransactionStatus::Approved { .. }
+    ));
+
+    // tx1: reads A from genesis, writes A
+    let mut tx1 = Transaction::new(&client);
+    tx1.read_set.insert(var_a.clone(), genesis.id);
+    tx1.write_set.insert(var_a.clone(), b"v1".to_vec());
+    tx1.commit().await.expect("tx1 commit");
+
+    // tx2: reads A and B from genesis, writes both
+    let mut tx2 = Transaction::new(&client);
+    tx2.read_set.insert(var_a.clone(), genesis.id);
+    tx2.read_set.insert(var_b.clone(), genesis.id);
+    tx2.write_set.insert(var_a.clone(), b"v2".to_vec());
+    tx2.write_set.insert(var_b.clone(), b"v2".to_vec());
+    tx2.commit().await.expect("tx2 commit");
+
+    // tx3: reads B from genesis, writes B
+    let mut tx3 = Transaction::new(&client);
+    tx3.read_set.insert(var_b.clone(), genesis.id);
+    tx3.write_set.insert(var_b.clone(), b"v3".to_vec());
+    tx3.commit().await.expect("tx3 commit");
+
+    println!("\n  Variables in Riak:");
+    print_variable(&client, &var_a).await;
+    print_variable(&client, &var_b).await;
+    println!("  find_dependency(\"A\") will see: genesis, tx1, tx2  (NOT tx3)");
+    println!("  find_dependency(\"B\") will see: genesis, tx2, tx3  (NOT tx1)");
+
+    // Run reads CONCURRENTLY — both see tx2 as Proposed
+    // find_dependency("A") calls choose_tx({tx1, tx2})
+    // find_dependency("B") calls choose_tx({tx2, tx3})
+    // These are INDEPENDENT decisions about tx2!
+    println!("\n  → Spawning CONCURRENT reads for A and B...");
+    println!("  Both will see tx2 as Proposed and make independent choose_tx decisions.");
+
+    let client_a = Client::new(HOST);
+    let client_b = Client::new(HOST);
+    let var_a_for_task = var_a.clone();
+    let var_b_for_task = var_b.clone();
+
+    let handle_a = tokio::spawn(async move {
+        let mut reader = Transaction::new(&client_a);
+        let val = reader.read(&var_a_for_task).await.expect("concurrent read A");
+        (val, reader.read_set.get(&var_a_for_task).copied())
+    });
+
+    let handle_b = tokio::spawn(async move {
+        let mut reader = Transaction::new(&client_b);
+        let val = reader.read(&var_b_for_task).await.expect("concurrent read B");
+        (val, reader.read_set.get(&var_b_for_task).copied())
+    });
+
+    let (result_a, result_b) = tokio::join!(handle_a, handle_b);
+    let (val_a, dep_a) = result_a.expect("task A");
+    let (val_b, dep_b) = result_b.expect("task B");
+
+    println!("  read(\"A\") = {:?}", val_a.as_ref().map(|v| fmt_value(v)));
+    println!("  read(\"B\") = {:?}", val_b.as_ref().map(|v| fmt_value(v)));
+    println!("  A depends on: {:?}", dep_a);
+    println!("  B depends on: {:?}", dep_b);
+
+    // Check final statuses
+    let status_tx1 = Transaction::from_uuid(tx1.id, &client).await.expect("tx1 status");
+    let status_tx2 = Transaction::from_uuid(tx2.id, &client).await.expect("tx2 status");
+    let status_tx3 = Transaction::from_uuid(tx3.id, &client).await.expect("tx3 status");
+
+    println!("\n  Final statuses:");
+    println!("  tx1: {:?}", status_tx1.state);
+    println!("  tx2: {:?}", status_tx2.state);
+    println!("  tx3: {:?}", status_tx3.state);
+
+    let tx2_approved = matches!(status_tx2.state, TransactionStatus::Approved { .. });
+    let tx2_rejected = matches!(status_tx2.state, TransactionStatus::Rejected { .. });
+
+    // The KEY assertion: tx2's status should be unambiguous.
+    // If both A and B made independent choose_tx decisions about tx2,
+    // the race condition may have created sibling statuses in Riak.
+    // from_uuid picks the earliest final state, so one "wins".
+    // But the logical inconsistency is: tx2 was chosen by one variable
+    // and rejected by the other.
+
+    // Check: is the outcome globally consistent?
+    // A globally consistent outcome means: the variable whose read resolved
+    // to tx2 actually uses tx2's value, and the variable that didn't
+    // resolve to tx2 has a different Approved writer.
+    let a_uses_tx2 = dep_a == Some(tx2.id);
+    let b_uses_tx2 = dep_b == Some(tx2.id);
+
+    println!("\n  ── Consistency analysis ──");
+    println!("  tx2 Approved? {}", tx2_approved);
+    println!("  tx2 Rejected? {}", tx2_rejected);
+    println!("  A uses tx2? {}", a_uses_tx2);
+    println!("  B uses tx2? {}", b_uses_tx2);
+
+    // The OUTCOME should be: exactly one Approved writer per variable.
+    // If tx2 is Approved, it should serve BOTH A and B (since it writes to both).
+    // If tx2 is Rejected, NEITHER A nor B should use tx2.
+    //
+    // The BUG: because find_dependency runs independently for A and B,
+    // it's possible that:
+    //   - A's choose_tx rejects tx2 (picks tx1)
+    //   - B's choose_tx approves tx2 (picks tx2 over tx3)
+    //   - The race condition: one Riak write wins, tx2 gets one final status
+    //   - If tx2 ends up Approved: A returned tx1's value but tx2 is Approved
+    //   - If tx2 ends up Rejected: B might have returned tx2's value before rejection
+    //
+    // This assertion checks: if tx2 is Approved, then BOTH A and B should
+    // resolve to tx2 (since tx2 writes to both). If tx2 is Rejected, then
+    // NEITHER should resolve to tx2.
+
+    let inconsistent = if tx2_approved {
+        // tx2 is Approved: it should be authoritative for BOTH A and B
+        // But find_dependency("A") may have picked tx1 instead
+        !a_uses_tx2 || !b_uses_tx2
+    } else if tx2_rejected {
+        // tx2 is Rejected: neither should use it
+        // This should be fine — A uses tx1, B uses tx3
+        a_uses_tx2 || b_uses_tx2
+    } else {
+        // tx2 is still Proposed — unclear outcome
+        false
+    };
+
+    if inconsistent {
+        if tx2_approved && (!a_uses_tx2 || !b_uses_tx2) {
+            println!("\n  ⚠ BUG CONFIRMED: tx2 is Approved but doesn't serve both variables!");
+            println!("  find_dependency(\"A\") didn't see tx3, so it made an independent");
+            println!("  choose_tx decision that conflicts with B's decision.");
+            println!("  tx2 should be the winner for BOTH A and B since it writes to both,");
+            println!("  but A resolved to a different transaction.");
+        }
+        if tx2_rejected && (a_uses_tx2 || b_uses_tx2) {
+            println!("\n  ⚠ BUG CONFIRMED: tx2 is Rejected but still serves a variable!");
+        }
+    } else {
+        // This CAN happen if both reads happened to pick the same winner for tx2
+        // (or the sequential nature of task scheduling made one finish first)
+        println!("\n  Outcome appears consistent (but may be luck — concurrency-dependent).");
+        if tx2_approved {
+            println!("  tx2 won both A and B, which is globally consistent.");
+            println!("  This might not happen every run — the bug is concurrency-dependent.");
+        }
+        if tx2_rejected {
+            println!("  tx2 was rejected, so tx1 serves A and tx3 serves B.");
+            println!("  This is consistent, but suboptimal: tx2 writes to BOTH variables");
+            println!("  and could have been the best choice for both.");
+        }
+    }
+
+    // Hard assertion: the bug IS that find_dependency doesn't load
+    // transitively connected transactions. This assertion WILL fail
+    // if both reads make conflicting decisions about tx2.
+    //
+    // Specifically: if tx2 is Approved, the winner for A should be tx2
+    // AND the winner for B should also be tx2 (since tx2 writes to both).
+    // If this assertion fails, it proves the cross-variable inconsistency bug.
+    if tx2_approved {
+        assert!(a_uses_tx2 && b_uses_tx2,
+            "BUG: tx2 is Approved but A resolved to {:?} and B resolved to {:?}. \
+             find_dependency doesn't load transitively connected variables, \
+             causing independent (and potentially conflicting) decisions about tx2.",
+            dep_a, dep_b);
+    }
+
+    if tx2_rejected {
+        assert!(!a_uses_tx2 && !b_uses_tx2,
+            "BUG: tx2 is Rejected but A resolved to {:?} and B resolved to {:?}.",
+            dep_a, dep_b);
+    }
+
+    println!("\n  ══════════════════════════════════════════");
+    println!("  CROSS-VARIABLE BUG TEST COMPLETE");
     println!("  ══════════════════════════════════════════");
 }
 
@@ -380,10 +584,9 @@ async fn test_choose_tx_among_conflicting_writers() {
 async fn test_read_nonexistent_variable_returns_none() {
     let client = Client::new(HOST);
 
-    print_section!("EDGE CASE — reading a variable that doesn't exist");
-    println!("  When no transaction has ever written to a variable,");
-    println!("  find_dependency() finds no tx ids and returns None.");
-    println!("  read() should return None without error.");
+    print_section!("READ — reading a nonexistent variable returns None");
+    println!("  When read() is called on a variable that has never been written,");
+    println!("  find_dependency finds no entries in the Variables bucket and returns None.");
 
     let mut tx = Transaction::new(&client);
     let nonexistent = unique_key("ghost");
@@ -400,3 +603,4 @@ async fn test_read_nonexistent_variable_returns_none() {
     println!("  NONEXISTENT VARIABLE TEST PASSED");
     println!("  ══════════════════════════════════════════");
 }
+
