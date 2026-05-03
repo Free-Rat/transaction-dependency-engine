@@ -604,3 +604,205 @@ async fn test_read_nonexistent_variable_returns_none() {
     println!("  ══════════════════════════════════════════");
 }
 
+#[tokio::test]
+async fn test_stale_proposed_tx_enters_choose_tx_when_it_should_be_rejected() {
+    let client = Client::new(HOST);
+
+    print_section!("BUG: stale Proposed tx enters choose_tx instead of being rejected");
+    println!("  Setup:");
+    println!("    1. genesis writes B → Approved via first read");
+    println!("    2. tx1 writes B, reads B from genesis → Proposed → auto-approved (single tip)");
+    println!("    3. tx2 writes B, reads B from tx1 (legitimate successor) → Proposed");
+    println!("    4. stale_tx writes B, reads B from genesis (same parent as tx1!) → Proposed");
+    println!("");
+    println!("  The key insight: stale_tx.read_set[B] = genesis, same as tx1.read_set[B].");
+    println!("  This means stale_tx was proposed in the SAME GENERATION as tx1 (both");
+    println!("  depend on genesis for B). tx1 was approved, so stale_tx should be rejected");
+    println!("  — it already lost the competition for this variable slot.");
+    println!("");
+    println!("  But find_dependency doesn't check for this. When a later reader calls");
+    println!("  find_dependency(B), it sees tx2 (Proposed, reads tx1) and stale_tx");
+    println!("  (Proposed, reads genesis) as two competing tips. It calls choose_tx");
+    println!("  on them, even though stale_tx should have been excluded from the round");
+    println!("  because it shares a parent with an already-Approved writer (tx1).");
+    println!("");
+    println!("  If choose_tx picks stale_tx, it gets Approved — even though it depends");
+    println!("  on genesis (which was already superseded by tx1). This creates an");
+    println!("  inconsistent dependency chain: stale_tx → genesis, ignoring tx1 entirely.");
+
+    let myvar = unique_key("myvar");
+
+    // ── Step 1: genesis ──
+    println!("\n  → Creating genesis: write \"v0\"");
+    let mut genesis = Transaction::new(&client);
+    genesis.write_set.insert(myvar.clone(), b"v0".to_vec());
+    genesis.commit().await.expect("genesis commit");
+    print_transaction("genesis (Proposed)", &genesis);
+
+    // ── Step 2: auto-approve genesis ──
+    let mut approver = Transaction::new(&client);
+    let val = approver.read(&myvar).await.expect("approve genesis");
+    verify!("Approver sees \"v0\"", val == Some(b"v0".to_vec()));
+    let genesis_approved = Transaction::from_uuid(genesis.id, &client).await.expect("recheck genesis");
+    verify!("Genesis is Approved", matches!(genesis_approved.state, TransactionStatus::Approved { .. }));
+    print_transaction("genesis (Approved)", &genesis_approved);
+
+    // ── Step 3: tx1 — reads genesis, writes B. Single tip → auto-approved. ──
+    println!("\n  → Creating tx1: reads genesis, writes \"v1\"");
+    println!("     tx1 is the only Proposed writer on top of genesis, so it gets auto-approved.");
+    let mut tx1 = Transaction::new(&client);
+    tx1.read_set.insert(myvar.clone(), genesis.id);
+    tx1.write_set.insert(myvar.clone(), b"v1".to_vec());
+    tx1.commit().await.expect("tx1 commit");
+    print_transaction("tx1 (Proposed)", &tx1);
+
+    // First reader auto-approves tx1
+    let mut first_reader = Transaction::new(&client);
+    let val1 = first_reader.read(&myvar).await.expect("first read");
+    println!("  first_reader.read() = {:?}", val1.as_ref().map(|v| fmt_value(v)));
+    verify!("First reader sees \"v1\" (tx1's value)", val1 == Some(b"v1".to_vec()));
+
+    let tx1_after = Transaction::from_uuid(tx1.id, &client).await.expect("check tx1");
+    verify!("tx1 is Approved", matches!(tx1_after.state, TransactionStatus::Approved { .. }));
+    print_transaction("tx1 (Approved)", &tx1_after);
+
+    let tx1_approved_at = match &tx1_after.state {
+        TransactionStatus::Approved { at } => *at,
+        _ => panic!("expected Approved"),
+    };
+    println!("  tx1.approved_at = {}", tx1_approved_at);
+
+    // ── Step 4: tx2 — reads tx1, writes B. Legitimate successor. ──
+    println!("\n  → Creating tx2: reads tx1, writes \"v2\"");
+    println!("     tx2 is a legitimate successor of tx1 — it reads from tx1, not genesis.");
+    let mut tx2 = Transaction::new(&client);
+    tx2.read_set.insert(myvar.clone(), tx1.id);
+    tx2.write_set.insert(myvar.clone(), b"v2".to_vec());
+    tx2.commit().await.expect("tx2 commit");
+    print_transaction("tx2 (Proposed)", &tx2);
+
+    // ── Step 5: stale_tx — reads genesis (same parent as tx1), writes B. ──
+    //    This is the stale transaction. It should be rejected because:
+    //    - It depends on genesis for B (same as tx1)
+    //    - tx1 was already Approved for B
+    //    - stale_tx was proposed during or before tx1's approval, but committed
+    //      after tx1 was already Approved for B
+    //    - Therefore stale_tx is a "sibling competitor" of tx1 that already lost
+    println!("\n  → Creating stale_tx: reads genesis, writes \"v_stale\"");
+    println!("     stale_tx.read_set[B] = genesis (SAME PARENT as tx1!)");
+    println!("     This means stale_tx was a contemporary of tx1 that wasn't included");
+    println!("     in tx1's validation round. It should be Rejected, not enter a new");
+    println!("     choose_tx round with tx2.");
+    let mut stale_tx = Transaction::new(&client);
+    stale_tx.read_set.insert(myvar.clone(), genesis.id);
+    stale_tx.write_set.insert(myvar.clone(), b"v_stale".to_vec());
+    stale_tx.commit().await.expect("stale_tx commit");
+    print_transaction("stale_tx (Proposed)", &stale_tx);
+
+    let stale_state = Transaction::from_uuid(stale_tx.id, &client).await.expect("check stale");
+    let stale_proposed_at = match &stale_state.state {
+        TransactionStatus::Proposed { at } => *at,
+        other => panic!("expected Proposed, got {:?}", other),
+    };
+    println!("  stale_tx.proposed_at = {}", stale_proposed_at);
+
+    println!("\n  Variables in Riak:");
+    print_variable(&client, &myvar).await;
+
+    println!("\n  ── Dependency analysis ──");
+    println!("  tx1.read_set[B] = {} (genesis)", tx1.id);
+    println!("  tx2.read_set[B] = {} (tx1, the Approved writer)", tx2.id);
+    println!("  stale_tx.read_set[B] = {} (genesis, SAME as tx1's parent!)", genesis.id);
+    println!("");
+    println!("  CORRECT behavior: stale_tx should be Rejected because:");
+    println!("    1. tx1 is already Approved for B");
+    println!("    2. stale_tx.read_set[B] == tx1.read_set[B] (both read from genesis)");
+    println!("    3. stale_tx and tx1 are in the same generation (same parent for B)");
+    println!("    4. tx1 won that generation, so stale_tx should be rejected");
+    println!("");
+    println!("  BUGGY behavior (current): find_dependency treats stale_tx as a tip");
+    println!("  alongside tx2. Both have parents NOT in the writer set, so both are tips.");
+    println!("  find_dependency calls choose_tx({{tx2, stale_tx}}), and stale_tx might win.");
+
+    // ── Step 6: read B — triggers find_dependency ──
+    println!("\n  → Reading B to trigger find_dependency...");
+    let mut reader = Transaction::new(&client);
+    let val_b = reader.read(&myvar).await.expect("read B");
+    println!("  reader.read() = {:?}", val_b.as_ref().map(|v| fmt_value(v)));
+
+    // ── Check outcomes ──
+    let tx1_final = Transaction::from_uuid(tx1.id, &client).await.expect("tx1 final");
+    let tx2_final = Transaction::from_uuid(tx2.id, &client).await.expect("tx2 final");
+    let stale_final = Transaction::from_uuid(stale_tx.id, &client).await.expect("stale final");
+
+    println!("\n  ── Final states ──");
+    print_transaction("tx1 final", &tx1_final);
+    print_transaction("tx2 final", &tx2_final);
+    print_transaction("stale_tx final", &stale_final);
+
+    let dep = reader.read_set.get(&myvar).copied();
+    println!("\n  reader depends on: {:?}", dep);
+    println!("  reader.read = {:?}", val_b.as_ref().map(|v| fmt_value(v)));
+
+    // ── Assertions ──
+    // The reader should depend on either tx1 or tx2 (the legitimate chain),
+    // NOT on stale_tx (which reads from the superseded genesis).
+    let reader_depends_on_stale = dep == Some(stale_tx.id);
+    let stale_is_approved = matches!(stale_final.state, TransactionStatus::Approved { .. });
+    let stale_is_proposed = matches!(stale_final.state, TransactionStatus::Proposed { .. });
+
+    if stale_is_approved {
+        println!("\n  ⚠ BUG CONFIRMED: stale_tx was APPROVED!");
+        println!("  stale_tx reads from genesis (superseded by tx1) for variable B.");
+        println!("  It should have been Rejected because it's in the same generation");
+        println!("  as tx1 (both depend on genesis for B), and tx1 already won.");
+        println!("  Instead, choose_tx included stale_tx in the round and it won,");
+        println!("  creating a broken dependency chain: stale_tx → genesis, bypassing tx1.");
+    }
+
+    if stale_is_proposed {
+        println!("\n  ⚠ BUG CONFIRMED: stale_tx is still PROPOSED (zombie).");
+        println!("  It was left out of the resolution because find_dependency");
+        println!("  preferred an Approved tip (tx1) over the Proposed stale_tx.");
+        println!("  But stale_tx should have been explicitly Rejected, not left");
+        println!("  as a zombie that could cause problems later.");
+    }
+
+    // KEY ASSERTION: stale_tx should be Rejected.
+    // It shares a parent with an already-Approved writer (tx1) for the same variable.
+    // find_dependency should detect this and reject it, not leave it as Proposed
+    // or (worse) let it win a choose_tx round.
+    assert!(
+        matches!(stale_final.state, TransactionStatus::Rejected { .. }),
+        "BUG: stale_tx should be Rejected (same parent as Approved tx1 for variable B), \
+         but its state is {:?}. \
+         stale_tx.read_set[B] = genesis (same as tx1), meaning they compete for the \
+         same variable slot. Since tx1 already won that competition, stale_tx should \
+         be Rejected.",
+        stale_final.state
+    );
+
+    // Additionally: the reader should NOT depend on stale_tx.
+    // If stale_tx won choose_tx, the reader depends on it — that's wrong.
+    assert!(
+        !reader_depends_on_stale,
+        "BUG: reader depends on stale_tx ({}) instead of the legitimate chain. \
+         stale_tx reads from genesis (superseded), bypassing the Approved tx1.",
+        stale_tx.id
+    );
+
+    // The reader should depend on whoever won: either tx1 or tx2.
+    // Both are in the legitimate chain: genesis → tx1 → tx2.
+    let reader_depends_on_tx1 = dep == Some(tx1.id);
+    let reader_depends_on_tx2 = dep == Some(tx2.id);
+    assert!(
+        reader_depends_on_tx1 || reader_depends_on_tx2,
+        "reader should depend on tx1 or tx2 (legitimate chain), but depends on {:?}",
+        dep
+    );
+
+    println!("\n  ══════════════════════════════════════════");
+    println!("  STALE PROPOSED TX BUG TEST COMPLETE");
+    println!("  ══════════════════════════════════════════");
+}
+
